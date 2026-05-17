@@ -123,7 +123,17 @@ resource files, not just the converted executable.
 ## Repository Layout
 
 ```text
-msdos2elks.c              Converter implementation.
+msdos2elks.c              Small umbrella translation unit.
+src/internal.h            Shared converter types, constants, and helpers.
+src/common.c              Byte-vector, relocation, and endian helpers.
+src/cli.c                 Option parsing and host file input.
+src/dos_bios_io.c         DOS, BIOS, and mouse I/O adapter emitters.
+src/patch.c               Interrupt discovery and binary rewrite engine.
+src/startup.c             PSP, argv, stack, and runtime memory setup.
+src/com.c                 DOS COM input conversion.
+src/mz_os2.c              DOS MZ parsing plus OS/2 NE output preparation.
+src/output.c              ELKS a.out and OS/2 NE file writers.
+src/main.c                Converter command entry point.
 configure                 Host configuration script.
 Makefile                  Build, check, install, and clean targets.
 docs/CONVERTING.md        User conversion workflow.

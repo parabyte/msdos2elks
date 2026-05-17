@@ -19,6 +19,22 @@ at the entry point belong to the unpacker, not the program that should run.
 plain DOS image with locally installed unpacking tools, then retries the same
 converter.
 
+## Source Layout
+
+The source is split by converter subsystem:
+
+```text
+src/dos_bios_io.c  emits DOS, BIOS, and mouse compatibility stubs
+src/patch.c        finds interrupt sites and rewrites them to stub calls
+src/startup.c      builds PSP, argv, stack, and runtime memory state
+src/com.c          handles COM layout
+src/mz_os2.c       handles MZ parsing and OS/2 NE segment construction
+src/output.c       writes ELKS a.out and OS/2 NE executable files
+```
+
+`msdos2elks.c` includes these modules as one translation unit.  That keeps
+helper functions file-local while avoiding a large monolithic source file.
+
 ## COM Layout
 
 COM programs normally enter at offset `0100h` with `CS == DS == ES == SS`.
