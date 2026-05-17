@@ -1,0 +1,6 @@
+/msdos2elks
+/*.o
+/config.log
+/config.mk
+/config.status
+/.deps/
