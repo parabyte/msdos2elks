@@ -183,6 +183,59 @@ mz_heap_from_minalloc (uint16_t minalloc)
   return (uint16_t) bytes;
 }
 
+static int
+mz_entry_loads_ds_from_cs (const uint8_t *image, size_t image_len,
+                           uint32_t entry)
+{
+  size_t pos;
+  size_t end;
+  uint8_t cs_regs = 0;
+
+  if (entry >= image_len)
+    return 0;
+
+  pos = (size_t) entry;
+  end = pos + 64u;
+  if (end > image_len)
+    end = image_len;
+
+  while (pos + 1u < end)
+    {
+      uint8_t op = image[pos];
+      uint8_t modrm;
+      uint8_t reg;
+      size_t len;
+
+      if (op == 0x0e && image[pos + 1u] == 0x1f)
+        return 1;           /* push cs; pop ds */
+
+      if ((op == 0xe8 || op == 0xe9 || op == 0xea || op == 0xcd
+           || op == 0xc2 || op == 0xc3 || op == 0xca || op == 0xcb))
+        return 0;
+
+      if ((op == 0x8c || op == 0x8e) && pos + 1u < end)
+        {
+          modrm = image[pos + 1u];
+          if ((modrm & 0xc0u) == 0xc0u)
+            {
+              reg = (uint8_t) (modrm & 7u);
+              if (op == 0x8c && ((modrm >> 3) & 3u) == 1u)
+                cs_regs |= (uint8_t) (1u << reg);
+              else if (op == 0x8e && ((modrm >> 3) & 3u) == 3u
+                       && (cs_regs & (uint8_t) (1u << reg)))
+                return 1;   /* mov reg, cs; ...; mov ds, reg */
+            }
+          pos += 2u;
+          continue;
+        }
+
+      len = scan_instruction_len (image + pos, end - pos);
+      pos += len ? len : 1u;
+    }
+
+  return 0;
+}
+
 static struct mz_segmap
 map_mz_segment_value (uint16_t val, uint16_t code_para,
                       uint16_t data_para, size_t text_len, size_t data_len)
@@ -399,8 +452,8 @@ mz_opcode_uses_modrm (uint8_t op)
 }
 
 static int
-adjust_mz_direct_ref (uint8_t *section, size_t start, size_t len,
-                      uint32_t delta)
+adjust_mz_direct_ref_for_segment (uint8_t *section, size_t start, size_t len,
+                                  uint32_t delta, uint8_t sreg)
 {
   size_t p = start;
   size_t end = start + len;
@@ -436,7 +489,12 @@ adjust_mz_direct_ref (uint8_t *section, size_t start, size_t len,
  opcode:
   if (p >= end)
     return 0;
-  if (seg_override >= 0 && seg_override != 3)
+  if (sreg == 3u)
+    {
+      if (seg_override >= 0 && seg_override != 3)
+        return 0;
+    }
+  else if (seg_override != (int) sreg)
     return 0;
 
   op = section[p];
@@ -456,6 +514,37 @@ adjust_mz_direct_ref (uint8_t *section, size_t start, size_t len,
     }
 
   return 0;
+}
+
+static int
+mz_instruction_reloads_segment (const uint8_t *section, size_t pos,
+                                size_t len, uint8_t sreg)
+{
+  uint8_t op;
+  uint8_t modrm;
+
+  while (len > 1u
+         && (section[pos] == 0xf0 || section[pos] == 0xf2
+             || section[pos] == 0xf3 || section[pos] == 0x26
+             || section[pos] == 0x2e || section[pos] == 0x36
+             || section[pos] == 0x3e))
+    {
+      pos++;
+      len--;
+    }
+
+  op = section[pos];
+  if ((op == 0x07 && sreg == 0u)
+      || (op == 0x17 && sreg == 2u)
+      || (op == 0x1f && sreg == 3u))
+    return 1;
+  if ((op == 0xc4 && sreg == 0u) || (op == 0xc5 && sreg == 3u))
+    return 1;
+  if (op != 0x8e || len < 2u)
+    return 0;
+
+  modrm = section[pos + 1u];
+  return (modrm & 0xc0u) == 0xc0u && ((modrm >> 3) & 3u) == sreg;
 }
 
 static int
@@ -492,10 +581,12 @@ mz_instruction_transfers_control (const uint8_t *section, size_t pos,
 }
 
 static int
-adjust_mz_ds_subsegment_block (uint8_t *section, size_t section_len,
-                               size_t loc, uint32_t delta)
+adjust_mz_subsegment_block (uint8_t *section, size_t section_len,
+                            size_t loc, uint32_t delta)
 {
   uint8_t reg;
+  uint8_t modrm;
+  uint8_t sreg;
   size_t pos;
   size_t limit;
   unsigned adjusted = 0;
@@ -506,7 +597,13 @@ adjust_mz_ds_subsegment_block (uint8_t *section, size_t section_len,
     return 0;
 
   reg = (uint8_t) (section[loc - 1u] - 0xb8u);
-  if (section[loc + 2u] != 0x8e || section[loc + 3u] != 0xd8u + reg)
+  if (section[loc + 2u] != 0x8e)
+    return 0;
+  modrm = section[loc + 3u];
+  if ((modrm & 0xc7u) != (uint8_t) (0xc0u | reg))
+    return 0;
+  sreg = (uint8_t) ((modrm >> 3) & 3u);
+  if (sreg == 1u)
     return 0;
 
   pos = loc + 4u;
@@ -515,14 +612,15 @@ adjust_mz_ds_subsegment_block (uint8_t *section, size_t section_len,
     {
       size_t insn_len;
 
-      if (section[pos] == 0x1f)          /* pop ds */
-        return adjusted != 0;
       insn_len = scan_instruction_len (section + pos, section_len - pos);
       if (insn_len == 0 || pos + insn_len > section_len)
         return 0;
+      if (mz_instruction_reloads_segment (section, pos, insn_len, sreg))
+        return adjusted != 0;
       if (mz_instruction_transfers_control (section, pos, insn_len))
         return 0;
-      adjusted += adjust_mz_direct_ref (section, pos, insn_len, delta);
+      adjusted += adjust_mz_direct_ref_for_segment (section, pos, insn_len,
+                                                    delta, sreg);
       pos += insn_len;
     }
 
@@ -536,6 +634,8 @@ try_adjust_mz_far_offset (uint8_t *section, size_t section_len, size_t loc,
 {
   size_t off_loc;
 
+  (void) target_section;
+
   if (delta == 0)
     return 1;
   if (loc < 2u)
@@ -545,8 +645,8 @@ try_adjust_mz_far_offset (uint8_t *section, size_t section_len, size_t loc,
     off_loc = loc - 2u;
   else if (reloc_site_is_split_far_pointer (section, loc))
     off_loc = loc - 3u;
-  else if (require_code_pattern && target_section == MZ_SEC_DATA
-           && adjust_mz_ds_subsegment_block (section, section_len, loc, delta))
+  else if (require_code_pattern
+           && adjust_mz_subsegment_block (section, section_len, loc, delta))
     return 1;
   else if (require_code_pattern
            && adjust_mz_stored_far_pointer (section, section_len, loc, delta))
@@ -626,7 +726,8 @@ ne_add_segment (struct image *img, uint32_t mz_base, const uint8_t *src,
 static void
 append_ne_mz_startup (struct image *img, unsigned startup_seg,
                       unsigned target_seg, uint16_t target_off,
-                      int install_int21, uint16_t int21_handler)
+                      int install_int21, uint16_t int21_handler,
+                      uint16_t psp_top_para)
 {
   static const uint8_t prefix[] = {
     0x55, 0x89, 0xe5,       /* push bp; mov bp, sp */
@@ -659,6 +760,23 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
 
   if (install_int21)
     emit_install_int21_vector (&seg->bytes, int21_handler);
+  if (psp_top_para)
+    {
+      emit8 (&seg->bytes, 0x50);        /* preserve ax */
+      emit8 (&seg->bytes, 0x8c);
+      emit8 (&seg->bytes, 0xc8);        /* ax = cs */
+      emit8 (&seg->bytes, 0x05);
+      emit16 (&seg->bytes, psp_top_para);
+      emit8 (&seg->bytes, 0x36);
+      emit8 (&seg->bytes, 0xa3);
+      emit16 (&seg->bytes, 0x0002);     /* ss:[PSP top] = cs + top */
+      emit8 (&seg->bytes, 0x31);
+      emit8 (&seg->bytes, 0xc0);
+      emit8 (&seg->bytes, 0x36);
+      emit8 (&seg->bytes, 0xa3);
+      emit16 (&seg->bytes, 0x002c);     /* ss:[environment] = 0 */
+      emit8 (&seg->bytes, 0x58);
+    }
   vec_append (&seg->bytes, prefix, sizeof (prefix));
   if (seg->bytes.len + 5u > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
@@ -725,7 +843,9 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
   size_t data_len = data_base < image_len ? image_len - data_base : 0;
   unsigned data_seg;
   int entry_seg;
+  int runtime_in_code;
   uint32_t pos;
+  uint16_t psp_top_para = 0;
   uint16_t i;
 
   (void) input_len;
@@ -764,8 +884,34 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
                                NESEG_DATA);
   img->ne_auto_data = data_seg;
 
-  append_runtime_state_to_data (&img->ne_seg[data_seg].bytes, img->heap,
-                                img->stack, img->bss, &rt);
+  runtime_in_code = data_base >= image_len && image_len <= ELKS_MAX16
+                    && mz_entry_loads_ds_from_cs (image, image_len,
+                                                  code_base + h->ip);
+  if (runtime_in_code)
+    {
+      struct ne_seg_image *seg = &img->ne_seg[0];
+      uint32_t reserve = 0;
+      uint32_t max_reserve = 0;
+
+      if (seg->bytes.len < ELKS_MAX16)
+        {
+          max_reserve = ELKS_MAX16 - (uint32_t) seg->bytes.len;
+          if (max_reserve > 4096u)
+            max_reserve -= 4096u;
+          else
+            max_reserve = 0;
+        }
+      reserve = max_reserve;
+      if (reserve)
+        vec_append_zeros (&seg->bytes, (size_t) reserve);
+      psp_top_para = align_para ((uint32_t) seg->bytes.len);
+      append_runtime_state_to_data (&seg->bytes, img->heap, img->stack,
+                                    img->bss, &rt);
+    }
+  else
+    append_runtime_state_to_data (&img->ne_seg[data_seg].bytes, img->heap,
+                                  img->stack, img->bss, &rt);
+
   data_len = img->ne_seg[data_seg].bytes.len;
   if (data_len + img->bss > ELKS_MAX16)
     die ("NE data segment is too large");
@@ -773,6 +919,14 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
   if (h->ss == data_para && h->sp > img->ne_seg[data_seg].min_alloc)
     img->ne_seg[data_seg].min_alloc = h->sp;
   cap_ne_auto_heap (img, data_seg, opts);
+
+  if (!runtime_in_code)
+    for (i = 0; i < img->ne_nsegs; i++)
+      if (!(img->ne_seg[i].flags & NESEG_DATA))
+        {
+          patch_mz_stack_setup (&img->ne_seg[i].bytes, stats);
+          patch_dos_stack_switches (&img->ne_seg[i].bytes, stats);
+        }
 
   for (i = 0; i < h->crlc; i++)
     {
@@ -839,13 +993,13 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
       append_ne_mz_startup (img, 0, (unsigned) entry_seg,
                             ne_local_offset (&img->ne_seg[entry_seg],
                                              code_base + h->ip),
-                            1, handler);
+                            1, handler, psp_top_para);
     }
   else
     append_ne_mz_startup (img, 0, (unsigned) entry_seg,
                           ne_local_offset (&img->ne_seg[entry_seg],
                                            code_base + h->ip),
-                          0, 0);
+                          0, 0, psp_top_para);
   if (img->ne_seg[0].bytes.len > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
   img->ne_seg[0].mz_len = (uint32_t) img->ne_seg[0].bytes.len;
@@ -892,6 +1046,11 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
   data_para = opts->mz_data_set
               ? opts->mz_data_seg
               : guess_mz_data_para (image, image_len, input, &h, code_para);
+  if (!opts->mz_data_set
+      && image_len <= ELKS_MAX16
+      && mz_entry_loads_ds_from_cs (image, image_len,
+                                    ((uint32_t) code_para << 4) + h.ip))
+    data_para = align_para ((uint32_t) image_len);
 
   code_base = (uint32_t) code_para << 4;
   data_base = (uint32_t) data_para << 4;
@@ -998,4 +1157,3 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
              code_para, data_para, (unsigned) img->text.len,
              (unsigned) img->data.len, img->heap, img->stack);
 }
-

@@ -658,6 +658,8 @@ emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt
 {
   emit8 (v, 0xa2);
   emit16 (v, rt->video_mode_off);  /* mov [video_mode], al */
+  emit8 (v, 0xb4);
+  emit8 (v, 0x00);                 /* mov ah, 00h */
   emit8 (v, 0xcd);
   emit8 (v, 0x10);                 /* let BIOS switch real hardware */
   emit8 (v, 0xf8);
@@ -667,12 +669,69 @@ emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt
 static void
 emit_bios_get_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt)
 {
+  size_t done_from_low;
+  size_t wide_from_2_or_3;
+  size_t done_from_4_or_5;
+  size_t wide_from_6_or_7;
+  size_t done_from_other;
+  size_t wide_pos;
+  size_t done_pos;
+
   emit8 (v, 0xa0);
   emit16 (v, rt->video_mode_off);  /* al = current converted mode */
   emit8 (v, 0xb4);
+  emit8 (v, 0x28);                 /* 40 columns by default */
+  emit8 (v, 0x3c);
+  emit8 (v, 0x02);                 /* cmp al, 2 */
+  emit8 (v, 0x72);                 /* jb done */
+  done_from_low = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 0x03);                 /* cmp al, 3 */
+  emit8 (v, 0x76);                 /* jbe wide */
+  wide_from_2_or_3 = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 0x06);                 /* cmp al, 6 */
+  emit8 (v, 0x72);                 /* jb done */
+  done_from_4_or_5 = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 0x07);                 /* cmp al, 7 */
+  emit8 (v, 0x76);                 /* jbe wide */
+  wide_from_6_or_7 = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xeb);
+  done_from_other = v->len;
+  emit8 (v, 0);
+
+  wide_pos = v->len;
+  emit8 (v, 0xb4);
   emit8 (v, 0x50);                 /* 80 columns */
+
+  done_pos = v->len;
   emit8 (v, 0x31);
   emit8 (v, 0xdb);                 /* active page 0 */
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+
+  v->data[done_from_low] = (uint8_t) (done_pos - (done_from_low + 1u));
+  v->data[wide_from_2_or_3] =
+    (uint8_t) (wide_pos - (wide_from_2_or_3 + 1u));
+  v->data[done_from_4_or_5] =
+    (uint8_t) (done_pos - (done_from_4_or_5 + 1u));
+  v->data[wide_from_6_or_7] =
+    (uint8_t) (wide_pos - (wide_from_6_or_7 + 1u));
+  v->data[done_from_other] = (uint8_t) (done_pos - (done_from_other + 1u));
+}
+
+static void
+emit_bios_set_palette_stub (struct byte_vec *v)
+{
+  emit8 (v, 0xb4);
+  emit8 (v, 0x0b);                 /* mov ah, 0Bh */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x10);                 /* let BIOS update CGA palette state */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
@@ -767,6 +826,8 @@ emit_bios_write_pixel_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0xc3);
 
   bios_pos = v->len;
+  emit8 (v, 0xb4);
+  emit8 (v, 0x0c);          /* mov ah, 0Ch */
   emit8 (v, 0xcd);
   emit8 (v, 0x10);          /* preserve BIOS behavior outside mode 13h */
   emit8 (v, 0xf8);
@@ -809,6 +870,8 @@ emit_bios_read_pixel_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0xc3);
 
   bios_pos = v->len;
+  emit8 (v, 0xb4);
+  emit8 (v, 0x0d);          /* mov ah, 0Dh */
   emit8 (v, 0xcd);
   emit8 (v, 0x10);          /* preserve BIOS behavior outside mode 13h */
   emit8 (v, 0xf8);
@@ -831,8 +894,10 @@ emit_bios_video_stub_for_fn (struct byte_vec *v, uint8_t fn,
     case 0x05:              /* select active display page */
     case 0x06:              /* scroll up */
     case 0x07:              /* scroll down */
-    case 0x0b:              /* set palette/background */
       emit_clear_carry_stub (v);
+      return 1;
+    case 0x0b:              /* set palette/background */
+      emit_bios_set_palette_stub (v);
       return 1;
     case 0x03:              /* get cursor position and size */
       emit_bios_get_cursor_stub (v);
