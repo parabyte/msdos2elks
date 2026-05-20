@@ -889,7 +889,8 @@ emit_direct_console_stub (struct byte_vec *v)
 }
 
 static void
-emit_read_char_stub (struct byte_vec *v, int echo, int bios_key)
+emit_read_char_stub (struct byte_vec *v, int echo, int bios_key,
+                     const struct runtime_info *rt)
 {
   size_t js_pos;
   size_t err_pos;
@@ -901,8 +902,9 @@ emit_read_char_stub (struct byte_vec *v, int echo, int bios_key)
   emit8 (v, 0x50);          /* temp byte */
   emit8 (v, 0x89);
   emit8 (v, 0xe5);          /* bp = sp */
-  emit8 (v, 0xbb);
-  emit16 (v, 0);            /* stdin */
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);      /* bx = keyboard fd */
   emit8 (v, 0x89);
   emit8 (v, 0xe9);          /* cx = bp */
   emit8 (v, 0xba);
@@ -970,6 +972,591 @@ emit_read_char_stub (struct byte_vec *v, int echo, int bios_key)
 }
 
 static void
+patch_rel8 (struct byte_vec *v, size_t pos, size_t target)
+{
+  long rel = (long) target - (long) (pos + 1u);
+
+  if (rel < -128 || rel > 127)
+    die ("short branch target out of range while emitting keyboard stub");
+  v->data[pos] = (uint8_t) rel;
+}
+
+static void
+patch_rel16 (struct byte_vec *v, size_t pos, size_t target)
+{
+  long rel = (long) target - (long) (pos + 2u);
+
+  put16 (v->data + pos, (uint16_t) rel);
+}
+
+static void
+emit_scan_ascii_case (struct byte_vec *v, uint8_t scan, uint8_t ascii,
+                      size_t *ret_jmps, size_t *nret, size_t cap)
+{
+  if (*nret >= cap)
+    die ("keyboard scan table is too large");
+
+  emit8 (v, 0x80);
+  emit8 (v, 0xfc);
+  emit8 (v, scan);          /* cmp ah, scan */
+  emit8 (v, 0x75);
+  emit8 (v, 0x05);          /* jne next */
+  emit8 (v, 0xb0);
+  emit8 (v, ascii);         /* mov al, ascii */
+  emit8 (v, 0xe9);
+  ret_jmps[*nret] = v->len;
+  (*nret)++;
+  emit16 (v, 0);            /* jmp return */
+}
+
+static void
+emit_ascii_scan_case (struct byte_vec *v, uint8_t ascii, uint8_t scan,
+                      size_t *ret_jmps, size_t *nret, size_t cap)
+{
+  if (*nret >= cap)
+    die ("keyboard ASCII table is too large");
+
+  emit8 (v, 0x3c);
+  emit8 (v, ascii);         /* cmp al, ascii */
+  emit8 (v, 0x75);
+  emit8 (v, 0x05);          /* jne next */
+  emit8 (v, 0xb4);
+  emit8 (v, scan);          /* mov ah, scan */
+  emit8 (v, 0xe9);
+  ret_jmps[*nret] = v->len;
+  (*nret)++;
+  emit16 (v, 0);            /* jmp return */
+}
+
+static void __attribute__ ((unused))
+emit_bios_raw_scancode_read_key_stub (struct byte_vec *v,
+                                      const struct runtime_info *rt)
+{
+  static const struct
+  {
+    uint8_t scan;
+    uint8_t ascii;
+  } ascii_cases[] =
+  {
+    { 0x01, 0x1b }, { 0x0c, '-' },  { 0x0d, '=' },  { 0x0e, 0x08 },
+    { 0x0f, 0x09 }, { 0x10, 'q' },  { 0x11, 'w' },  { 0x12, 'e' },
+    { 0x13, 'r' },  { 0x14, 't' },  { 0x15, 'y' },  { 0x16, 'u' },
+    { 0x17, 'i' },  { 0x18, 'o' },  { 0x19, 'p' },  { 0x1a, '[' },
+    { 0x1b, ']' },  { 0x1c, 0x0d }, { 0x1e, 'a' },  { 0x1f, 's' },
+    { 0x20, 'd' },  { 0x21, 'f' },  { 0x22, 'g' },  { 0x23, 'h' },
+    { 0x24, 'j' },  { 0x25, 'k' },  { 0x26, 'l' },  { 0x27, ';' },
+    { 0x28, '\'' }, { 0x29, '`' },  { 0x2b, '\\' }, { 0x2c, 'z' },
+    { 0x2d, 'x' },  { 0x2e, 'c' },  { 0x2f, 'v' },  { 0x30, 'b' },
+    { 0x31, 'n' },  { 0x32, 'm' },  { 0x33, ',' },  { 0x34, '.' },
+    { 0x35, '/' },  { 0x39, ' ' }
+  };
+  size_t ret_jmps[64];
+  size_t nret = 0;
+  size_t loop;
+  size_t call1;
+  size_t call2;
+  size_t not_e0_rel;
+  size_t read1_retry_rel;
+  size_t read2_retry_rel;
+  size_t release_retry_rel;
+  size_t digit_low_rel;
+  size_t digit_high_rel;
+  size_t zero_digit_rel;
+  size_t read_sub;
+  size_t ret;
+  size_t i;
+
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x55);          /* push bp */
+
+  loop = v->len;
+  emit8 (v, 0xe8);          /* call read_byte */
+  call1 = v->len;
+  emit16 (v, 0);
+  emit8 (v, 0x83);
+  emit8 (v, 0xf8);
+  emit8 (v, 0x01);          /* cmp ax, 1 */
+  emit8 (v, 0x75);
+  read1_retry_rel = v->len;
+  emit8 (v, 0);             /* jne loop */
+  emit8 (v, 0xa0);
+  emit16 (v, rt->io_buf_off);       /* mov al, [io_buf] */
+  emit8 (v, 0x3c);
+  emit8 (v, 0xe0);          /* cmp al, 0e0h */
+  emit8 (v, 0x75);
+  not_e0_rel = v->len;
+  emit8 (v, 0);
+
+  emit8 (v, 0xe8);          /* call read_byte */
+  call2 = v->len;
+  emit16 (v, 0);
+  emit8 (v, 0x83);
+  emit8 (v, 0xf8);
+  emit8 (v, 0x01);          /* cmp ax, 1 */
+  emit8 (v, 0x75);
+  read2_retry_rel = v->len;
+  emit8 (v, 0);             /* jne loop */
+  emit8 (v, 0xa0);
+  emit16 (v, rt->io_buf_off);       /* mov al, [io_buf] */
+
+  patch_rel8 (v, not_e0_rel, v->len);
+  emit8 (v, 0xa8);
+  emit8 (v, 0x80);          /* test al, 80h: ignore break codes */
+  emit8 (v, 0x75);
+  release_retry_rel = v->len;
+  emit8 (v, 0);             /* jnz loop */
+  emit8 (v, 0x88);
+  emit8 (v, 0xc4);          /* mov ah, al */
+  emit8 (v, 0x80);
+  emit8 (v, 0xe4);
+  emit8 (v, 0x7f);          /* and ah, 7fh */
+  emit8 (v, 0x30);
+  emit8 (v, 0xc0);          /* xor al, al */
+
+  emit8 (v, 0x80);
+  emit8 (v, 0xfc);
+  emit8 (v, 0x02);          /* cmp ah, 2 */
+  emit8 (v, 0x72);
+  digit_low_rel = v->len;
+  emit8 (v, 0);             /* jb not_digit */
+  emit8 (v, 0x80);
+  emit8 (v, 0xfc);
+  emit8 (v, 0x0b);          /* cmp ah, 0bh */
+  emit8 (v, 0x77);
+  digit_high_rel = v->len;
+  emit8 (v, 0);             /* ja not_digit */
+  emit8 (v, 0x80);
+  emit8 (v, 0xfc);
+  emit8 (v, 0x0b);          /* cmp ah, 0bh */
+  emit8 (v, 0x74);
+  zero_digit_rel = v->len;
+  emit8 (v, 0);             /* je zero_digit */
+  emit8 (v, 0x88);
+  emit8 (v, 0xe0);          /* mov al, ah */
+  emit8 (v, 0x04);
+  emit8 (v, 0x2f);          /* add al, '1' - 2 */
+  emit8 (v, 0xe9);
+  ret_jmps[nret++] = v->len;
+  emit16 (v, 0);
+  patch_rel8 (v, zero_digit_rel, v->len);
+  emit8 (v, 0xb0);
+  emit8 (v, '0');           /* scan 0bh is the 0 key */
+  emit8 (v, 0xe9);
+  ret_jmps[nret++] = v->len;
+  emit16 (v, 0);
+
+  patch_rel8 (v, digit_low_rel, v->len);
+  patch_rel8 (v, digit_high_rel, v->len);
+  for (i = 0; i < sizeof (ascii_cases) / sizeof (ascii_cases[0]); i++)
+    emit_scan_ascii_case (v, ascii_cases[i].scan, ascii_cases[i].ascii,
+                          ret_jmps, &nret,
+                          sizeof (ret_jmps) / sizeof (ret_jmps[0]));
+
+  ret = v->len;
+  for (i = 0; i < nret; i++)
+    patch_rel16 (v, ret_jmps[i], ret);
+  emit8 (v, 0x5d);          /* pop bp */
+  emit8 (v, 0x5a);          /* pop dx */
+  emit8 (v, 0x59);          /* pop cx */
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0xf8);          /* clc */
+  emit8 (v, 0xc3);
+
+  read_sub = v->len;
+  patch_rel16 (v, call1, read_sub);
+  patch_rel16 (v, call2, read_sub);
+  patch_rel8 (v, read1_retry_rel, loop);
+  patch_rel8 (v, read2_retry_rel, loop);
+  patch_rel8 (v, release_retry_rel, loop);
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);      /* mov bx, [keyboard_fd] */
+  emit8 (v, 0xb9);
+  emit16 (v, rt->io_buf_off);           /* mov cx, io_buf */
+  emit8 (v, 0xba);
+  emit16 (v, 1);                        /* mov dx, 1 */
+  emit8 (v, 0xb8);
+  emit16 (v, 3);                        /* read */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_bios_ascii_read_key_stub (struct byte_vec *v,
+                               const struct runtime_info *rt)
+{
+  static const struct
+  {
+    uint8_t ascii;
+    uint8_t scan;
+  } scan_cases[] =
+  {
+    { 0x1b, 0x01 }, { 0x0d, 0x1c }, { ' ', 0x39 },
+    { '0', 0x0b },  { '1', 0x02 },  { '2', 0x03 }, { '3', 0x04 },
+    { '4', 0x05 },  { '5', 0x06 },  { '6', 0x07 }, { '7', 0x08 },
+    { '8', 0x09 },  { '9', 0x0a },  { 'd', 0x20 }, { 'D', 0x20 },
+    { 'k', 0x25 },  { 'K', 0x25 }
+  };
+  size_t ret_jmps[32];
+  size_t nret = 0;
+  size_t loop;
+  size_t retry_rel;
+  size_t ret;
+  size_t read_sub;
+  size_t call1;
+  size_t i;
+
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+
+  loop = v->len;
+  emit8 (v, 0xe8);
+  call1 = v->len;
+  emit16 (v, 0);            /* call read_byte */
+  emit8 (v, 0x83);
+  emit8 (v, 0xf8);
+  emit8 (v, 0x01);          /* cmp ax, 1 */
+  emit8 (v, 0x75);
+  retry_rel = v->len;
+  emit8 (v, 0);             /* jne loop */
+  emit8 (v, 0xa0);
+  emit16 (v, rt->io_buf_off);       /* mov al, [io_buf] */
+  emit8 (v, 0x3c);
+  emit8 (v, 0x0a);          /* map LF to DOS CR */
+  emit8 (v, 0x75);
+  emit8 (v, 0x02);
+  emit8 (v, 0xb0);
+  emit8 (v, 0x0d);
+  emit8 (v, 0x30);
+  emit8 (v, 0xe4);          /* ah = 0 unless matched below */
+
+  for (i = 0; i < sizeof (scan_cases) / sizeof (scan_cases[0]); i++)
+    emit_ascii_scan_case (v, scan_cases[i].ascii, scan_cases[i].scan,
+                          ret_jmps, &nret,
+                          sizeof (ret_jmps) / sizeof (ret_jmps[0]));
+
+  ret = v->len;
+  for (i = 0; i < nret; i++)
+    patch_rel16 (v, ret_jmps[i], ret);
+  emit8 (v, 0x5a);          /* pop dx */
+  emit8 (v, 0x59);          /* pop cx */
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+
+  read_sub = v->len;
+  patch_rel16 (v, call1, read_sub);
+  patch_rel8 (v, retry_rel, loop);
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit8 (v, 0xb9);
+  emit16 (v, rt->io_buf_off);
+  emit8 (v, 0xba);
+  emit16 (v, 1);
+  emit8 (v, 0xb8);
+  emit16 (v, 3);            /* read */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_bios_read_key_stub (struct byte_vec *v, const struct runtime_info *rt)
+{
+  size_t no_pending_rel;
+
+  emit8 (v, 0xa1);
+  emit16 (v, rt->keyboard_pending_off);
+  emit8 (v, 0x09);
+  emit8 (v, 0xc0);          /* pending AX? */
+  emit8 (v, 0x74);
+  no_pending_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xc7);
+  emit8 (v, 0x06);
+  emit16 (v, rt->keyboard_pending_off);
+  emit16 (v, 0);
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+  patch_rel8 (v, no_pending_rel, v->len);
+
+  emit_bios_ascii_read_key_stub (v, rt);
+}
+
+static void
+emit_bios_key_status_stub (struct byte_vec *v, const struct runtime_info *rt)
+{
+  size_t not_ready_jmp;
+  size_t ret_jmps[32];
+  size_t nret = 0;
+  size_t ret;
+  size_t i;
+  static const struct
+  {
+    uint8_t ascii;
+    uint8_t scan;
+  } scan_cases[] =
+  {
+    { 0x1b, 0x01 }, { 0x0d, 0x1c }, { ' ', 0x39 },
+    { '0', 0x0b },  { '1', 0x02 },  { '2', 0x03 }, { '3', 0x04 },
+    { '4', 0x05 },  { '5', 0x06 },  { '6', 0x07 }, { '7', 0x08 },
+    { '8', 0x09 },  { '9', 0x0a },  { 'd', 0x20 }, { 'D', 0x20 },
+    { 'k', 0x25 },  { 'K', 0x25 }
+  };
+
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit8 (v, 0xb9);
+  emit16 (v, rt->io_buf_off);
+  emit8 (v, 0xba);
+  emit16 (v, 1);
+  emit8 (v, 0xb8);
+  emit16 (v, 3);            /* read, using VMIN=0/VTIME=1 */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x83);
+  emit8 (v, 0xf8);
+  emit8 (v, 0x01);          /* cmp ax, 1 */
+  emit8 (v, 0x74);
+  emit8 (v, 0x03);          /* je got_char */
+  emit8 (v, 0xe9);
+  not_ready_jmp = v->len;
+  emit16 (v, 0);
+  emit8 (v, 0xa0);
+  emit16 (v, rt->io_buf_off);
+  emit8 (v, 0x3c);
+  emit8 (v, 0x0a);
+  emit8 (v, 0x75);
+  emit8 (v, 0x02);
+  emit8 (v, 0xb0);
+  emit8 (v, 0x0d);
+  emit8 (v, 0x30);
+  emit8 (v, 0xe4);
+  for (i = 0; i < sizeof (scan_cases) / sizeof (scan_cases[0]); i++)
+    emit_ascii_scan_case (v, scan_cases[i].ascii, scan_cases[i].scan,
+                          ret_jmps, &nret,
+                          sizeof (ret_jmps) / sizeof (ret_jmps[0]));
+  ret = v->len;
+  for (i = 0; i < nret; i++)
+    patch_rel16 (v, ret_jmps[i], ret);
+  emit8 (v, 0xa3);
+  emit16 (v, rt->keyboard_pending_off);
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x5b);
+  emit8 (v, 0x09);
+  emit8 (v, 0xc0);          /* clear ZF if AX != 0 */
+  emit8 (v, 0xc3);
+
+  put16 (v->data + not_ready_jmp,
+         (uint16_t) (v->len - (not_ready_jmp + 2u)));
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x5b);
+  emit8 (v, 0x39);
+  emit8 (v, 0xc0);          /* set ZF */
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_dos_key_status_stub (struct byte_vec *v, const struct runtime_info *rt)
+{
+  size_t not_ready_rel;
+  size_t done_jmp;
+  size_t ready;
+  size_t done;
+
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x56);          /* push si */
+  emit8 (v, 0x57);          /* push di */
+  emit8 (v, 0xbe);
+  emit16 (v, rt->io_buf_off);
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);      /* bx = keyboard fd */
+  emit8 (v, 0x88);
+  emit8 (v, 0xd9);          /* cl = bl */
+  emit8 (v, 0xb8);
+  emit16 (v, 1);
+  emit8 (v, 0xd3);
+  emit8 (v, 0xe0);          /* ax = 1 << fd */
+  emit8 (v, 0x89);
+  emit8 (v, 0x04);          /* [si] = read fd mask */
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);          /* ax = 0 */
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x02);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x04);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x06);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x08);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x0a);
+  emit8 (v, 0x43);          /* nfds = fd + 1 */
+  emit8 (v, 0x89);
+  emit8 (v, 0xf1);          /* cx = readfds */
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* dx = NULL writefds */
+  emit8 (v, 0x31);
+  emit8 (v, 0xff);          /* di = NULL exceptfds */
+  emit8 (v, 0xbe);
+  emit16 (v, (uint16_t) (rt->io_buf_off + 4u)); /* zero timeout */
+  emit8 (v, 0xb8);
+  emit16 (v, 63);           /* select */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);          /* test ax, ax */
+  emit8 (v, 0x7e);          /* jle not_ready */
+  not_ready_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xb8);
+  emit16 (v, 0x00ff);       /* DOS AH=0Bh: AL=ffh if ready */
+  emit8 (v, 0xe9);
+  done_jmp = v->len;
+  emit16 (v, 0);
+  ready = v->len;
+  v->data[not_ready_rel] = (uint8_t) (ready - (not_ready_rel + 1u));
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);          /* AL=0 if no character */
+  done = v->len;
+  put16 (v->data + done_jmp, (uint16_t) (done - (done_jmp + 2u)));
+  emit8 (v, 0x5f);          /* pop di */
+  emit8 (v, 0x5e);          /* pop si */
+  emit8 (v, 0x5a);          /* pop dx */
+  emit8 (v, 0x59);          /* pop cx */
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_enable_console_raw_scancodes (struct byte_vec *v,
+                                   const struct runtime_info *rt)
+{
+  enum
+  {
+    ELKS_SYS_IOCTL = 54,
+    ELKS_DCGET_GRAPH = 0x4401,
+    ELKS_DCSET_KRAW = 0x4403
+  };
+  size_t mode_ready_rel;
+  size_t no_fd_rel;
+  size_t text_mode_rel;
+  size_t mda_mode_rel;
+  size_t dcget_fail_rel;
+  size_t dcset_fail_rel;
+  size_t done;
+
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+
+  emit8 (v, 0x83);
+  emit8 (v, 0x3e);
+  emit16 (v, rt->keyboard_mode_off);
+  emit8 (v, 1);             /* already in raw scancode mode */
+  emit8 (v, 0x74);
+  mode_ready_rel = v->len;
+  emit8 (v, 0);
+
+  emit8 (v, 0x81);
+  emit8 (v, 0x3e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit16 (v, 0xffffu);      /* keyboard was not opened at startup */
+  emit8 (v, 0x74);
+  no_fd_rel = v->len;
+  emit8 (v, 0);
+
+  emit8 (v, 0xa0);
+  emit16 (v, rt->video_mode_off);
+  emit8 (v, 0x24);
+  emit8 (v, 0x7f);
+  emit8 (v, 0x3c);
+  emit8 (v, 0xff);          /* raw console locking is deferred by default */
+  emit8 (v, 0x72);
+  text_mode_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 0x07);          /* MDA text mode */
+  emit8 (v, 0x74);
+  mda_mode_rel = v->len;
+  emit8 (v, 0);
+
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit8 (v, 0xb9);
+  emit16 (v, ELKS_DCGET_GRAPH);
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_IOCTL);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);
+  emit8 (v, 0x78);
+  dcget_fail_rel = v->len;
+  emit8 (v, 0);
+
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit8 (v, 0xb9);
+  emit16 (v, ELKS_DCSET_KRAW);
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_IOCTL);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);
+  emit8 (v, 0x78);
+  dcset_fail_rel = v->len;
+  emit8 (v, 0);
+
+  emit8 (v, 0xc7);
+  emit8 (v, 0x06);
+  emit16 (v, rt->keyboard_mode_off);
+  emit16 (v, 1);
+
+  done = v->len;
+  patch_rel8 (v, mode_ready_rel, done);
+  patch_rel8 (v, no_fd_rel, done);
+  patch_rel8 (v, text_mode_rel, done);
+  patch_rel8 (v, mda_mode_rel, done);
+  patch_rel8 (v, dcget_fail_rel, done);
+  patch_rel8 (v, dcset_fail_rel, done);
+  emit8 (v, 0x5a);          /* pop dx */
+  emit8 (v, 0x59);          /* pop cx */
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0x58);          /* pop ax */
+}
+
+static void
 emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt)
 {
   emit8 (v, 0xa2);
@@ -978,6 +1565,7 @@ emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt
   emit8 (v, 0x00);                 /* mov ah, 00h */
   emit8 (v, 0xcd);
   emit8 (v, 0x10);                 /* let BIOS switch real hardware */
+  emit_enable_console_raw_scancodes (v, rt);
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
@@ -1009,6 +1597,19 @@ emit_bios_get_display_combination_stub (struct byte_vec *v)
   emit8 (v, 0xc0);          /* AL != 1Ah: no VGA/MCGA display-combo BIOS. */
   emit8 (v, 0x31);
   emit8 (v, 0xdb);
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_bios_no_vga_info_stub (struct byte_vec *v)
+{
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);          /* ax = 0 */
+  emit8 (v, 0x31);
+  emit8 (v, 0xc9);          /* cx = 0 */
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* dx = 0 */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
@@ -1098,21 +1699,18 @@ emit_bios_video_stub_for_fn (struct byte_vec *v, uint8_t fn,
 }
 
 static int
-emit_bios_keyboard_stub_for_fn (struct byte_vec *v, uint8_t fn)
+emit_bios_keyboard_stub_for_fn (struct byte_vec *v, uint8_t fn,
+                                const struct runtime_info *rt)
 {
   switch (fn)
     {
     case 0x00:              /* read key */
     case 0x10:              /* enhanced read key */
-      emit_read_char_stub (v, 0, 1);
+      emit_bios_read_key_stub (v, rt);
       return 1;
     case 0x01:              /* check key */
     case 0x11:              /* enhanced check key */
-      emit8 (v, 0x31);
-      emit8 (v, 0xc0);      /* ax = 0 */
-      emit8 (v, 0x39);
-      emit8 (v, 0xc0);      /* ZF set: no key pending */
-      emit8 (v, 0xc3);
+      emit_bios_key_status_stub (v, rt);
       return 1;
     case 0x02:              /* get shift flags */
     case 0x12:
@@ -1264,7 +1862,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       emit_exit_stub (v, 0);
       return 1;
     case 0x01:
-      emit_read_char_stub (v, 1, 0);
+      emit_read_char_stub (v, 1, 0, rt);
       return 1;
     case 0x02:
       emit_write_char_stub (v);
@@ -1274,7 +1872,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       return 1;
     case 0x07:
     case 0x08:
-      emit_read_char_stub (v, 0, 0);
+      emit_read_char_stub (v, 0, 0, rt);
       return 1;
     case 0x09:
       emit_string_stub (v);
@@ -1300,7 +1898,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       emit_al_status_stub (v, 1);
       return 1;
     case 0x0b:
-      emit_success_stub (v);
+      emit_dos_key_status_stub (v, rt);
       return 1;
     case 0x0e:
       emit_select_drive_stub (v);
@@ -1455,7 +2053,7 @@ emit_stub_for_interrupt (struct byte_vec *v, uint8_t intr, uint8_t fn,
     case 0x10:
       return emit_bios_video_stub_for_fn (v, fn, rt);
     case 0x16:
-      return emit_bios_keyboard_stub_for_fn (v, fn);
+      return emit_bios_keyboard_stub_for_fn (v, fn, rt);
     case 0x1a:
       return emit_bios_clock_stub_for_fn (v, fn);
     case 0x21:
@@ -1485,6 +2083,193 @@ emit_install_int21_vector (struct byte_vec *v, uint16_t handler_off)
   emit8 (v, 0xc8);          /* mov ax, cs */
   emit8 (v, 0xa3);
   emit16 (v, 0x0086);       /* IVT[21h].segment */
+  emit8 (v, 0xfb);          /* sti */
+  emit8 (v, 0x58);          /* pop ax */
+  emit8 (v, 0x1f);          /* pop ds */
+}
+
+static void
+emit_stdin_raw_mode (struct byte_vec *v, const struct runtime_info *rt)
+{
+  enum
+  {
+    ELKS_SYS_IOCTL = 54,
+    ELKS_SYS_OPEN = 5,
+    ELKS_TCGETS = 0x5401,
+    ELKS_TCSETS = 0x5402,
+    ELKS_O_RDWR = 2,
+    ELKS_TERMIOS_IFLAG_OFF = 0,
+    ELKS_TERMIOS_LFLAG_OFF = 12,
+    ELKS_TERMIOS_VTIME_OFF = 22,
+    ELKS_TERMIOS_VMIN_OFF = 23,
+    ELKS_IFLAG_RAW_MASK = 0xfacdu,
+    ELKS_LFLAG_RAW_MASK = 0x7180u
+  };
+  size_t stdin_ok_rel;
+  size_t open_fail_rel;
+  size_t get_tty_fail_rel;
+  size_t raw_ready_jmp;
+  size_t stdin_ok;
+  size_t raw_ready;
+  size_t done;
+
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x56);          /* push si */
+  emit8 (v, 0xbe);
+  emit16 (v, rt->io_buf_off);
+
+  emit8 (v, 0xbb);
+  emit16 (v, 0);            /* stdin */
+  emit8 (v, 0xb9);
+  emit16 (v, ELKS_TCGETS);
+  emit8 (v, 0x89);
+  emit8 (v, 0xf2);          /* dx = si */
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_IOCTL);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);          /* test ax, ax */
+  emit8 (v, 0x90);
+  emit8 (v, 0x90);          /* prefer the active console device */
+  stdin_ok_rel = SIZE_MAX;
+
+  emit8 (v, 0xc7);
+  emit8 (v, 0x04);
+  emit16 (v, 0x642f);       /* "/d" */
+  emit8 (v, 0xc7);
+  emit8 (v, 0x44);
+  emit8 (v, 0x02);
+  emit16 (v, 0x7665);       /* "ev" */
+  emit8 (v, 0xc7);
+  emit8 (v, 0x44);
+  emit8 (v, 0x04);
+  emit16 (v, 0x632f);       /* "/c" */
+  emit8 (v, 0xc7);
+  emit8 (v, 0x44);
+  emit8 (v, 0x06);
+  emit16 (v, 0x6e6f);       /* "on" */
+  emit8 (v, 0xc7);
+  emit8 (v, 0x44);
+  emit8 (v, 0x08);
+  emit16 (v, 0x6f73);       /* "so" */
+  emit8 (v, 0xc7);
+  emit8 (v, 0x44);
+  emit8 (v, 0x0a);
+  emit16 (v, 0x656c);       /* "le" */
+  emit8 (v, 0xc6);
+  emit8 (v, 0x44);
+  emit8 (v, 0x0c);
+  emit8 (v, 0x00);
+  emit8 (v, 0x89);
+  emit8 (v, 0xf3);          /* bx = si */
+  emit8 (v, 0xb9);
+  emit16 (v, ELKS_O_RDWR);
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* dx = mode 0 */
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_OPEN);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);          /* test ax, ax */
+  emit8 (v, 0x78);          /* js done */
+  open_fail_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x89);
+  emit8 (v, 0xc3);          /* bx = opened tty fd */
+  emit8 (v, 0x89);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit8 (v, 0xb9);
+  emit16 (v, ELKS_TCGETS);
+  emit8 (v, 0x89);
+  emit8 (v, 0xf2);          /* dx = si */
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_IOCTL);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);          /* test ax, ax */
+  emit8 (v, 0x78);          /* js done; input still uses opened fd */
+  get_tty_fail_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xe9);          /* jmp raw_ready */
+  raw_ready_jmp = v->len;
+  emit16 (v, 0);
+
+  stdin_ok = v->len;
+  if (stdin_ok_rel != SIZE_MAX)
+    v->data[stdin_ok_rel] = (uint8_t) (stdin_ok - (stdin_ok_rel + 1u));
+  emit8 (v, 0x31);
+  emit8 (v, 0xdb);          /* bx = stdin */
+  emit8 (v, 0x89);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+
+  raw_ready = v->len;
+  put16 (v->data + raw_ready_jmp,
+         (uint16_t) (raw_ready - (raw_ready_jmp + 2u)));
+  emit8 (v, 0x81);
+  emit8 (v, 0x64);
+  emit8 (v, ELKS_TERMIOS_IFLAG_OFF);
+  emit16 (v, ELKS_IFLAG_RAW_MASK);
+  emit8 (v, 0x81);
+  emit8 (v, 0x64);
+  emit8 (v, ELKS_TERMIOS_LFLAG_OFF);
+  emit16 (v, ELKS_LFLAG_RAW_MASK);
+  emit8 (v, 0xc6);
+  emit8 (v, 0x44);
+  emit8 (v, ELKS_TERMIOS_VTIME_OFF);
+  emit8 (v, 1);
+  emit8 (v, 0xc6);
+  emit8 (v, 0x44);
+  emit8 (v, ELKS_TERMIOS_VMIN_OFF);
+  emit8 (v, 0);
+
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);      /* bx = keyboard fd */
+  emit8 (v, 0xb9);
+  emit16 (v, ELKS_TCSETS);
+  emit8 (v, 0x89);
+  emit8 (v, 0xf2);          /* dx = si */
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_IOCTL);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+
+  done = v->len;
+  v->data[open_fail_rel] = (uint8_t) (done - (open_fail_rel + 1u));
+  v->data[get_tty_fail_rel] = (uint8_t) (done - (get_tty_fail_rel + 1u));
+  emit8 (v, 0x5e);          /* pop si */
+  emit8 (v, 0x5a);          /* pop dx */
+  emit8 (v, 0x59);          /* pop cx */
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0x58);          /* pop ax */
+}
+
+static void
+emit_install_int16_vector (struct byte_vec *v, uint16_t handler_off)
+{
+  emit8 (v, 0x1e);          /* push ds */
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);          /* xor ax, ax */
+  emit8 (v, 0x8e);
+  emit8 (v, 0xd8);          /* mov ds, ax */
+  emit8 (v, 0xfa);          /* cli */
+  emit8 (v, 0xc7);
+  emit8 (v, 0x06);
+  emit16 (v, 0x0058);
+  emit16 (v, handler_off);  /* IVT[16h].offset */
+  emit8 (v, 0x8c);
+  emit8 (v, 0xc8);          /* mov ax, cs */
+  emit8 (v, 0xa3);
+  emit16 (v, 0x005a);       /* IVT[16h].segment */
   emit8 (v, 0xfb);          /* sti */
   emit8 (v, 0x58);          /* pop ax */
   emit8 (v, 0x1f);          /* pop ds */
@@ -1581,5 +2366,107 @@ append_int21_interrupt_handler (struct byte_vec *text,
     }
 
   (void) clear;
+  return (uint16_t) start;
+}
+
+static uint16_t
+append_int16_interrupt_handler (struct byte_vec *text,
+                                const struct runtime_info *rt)
+{
+  static const struct
+  {
+    uint8_t cmp_fn;
+    uint8_t adapter_fn;
+  } fns[] =
+  {
+    { 0x00, 0x00 }, { 0x01, 0x01 }, { 0x02, 0x02 },
+    { 0x10, 0x00 }, { 0x11, 0x01 }, { 0x12, 0x02 }
+  };
+  struct fixup
+  {
+    size_t call_rel;
+    size_t finish_rel;
+  };
+  struct fixup fixups[sizeof (fns) / sizeof (fns[0])];
+  uint32_t stubs[256];
+  size_t start = text->len;
+  size_t finish;
+  size_t set_zf;
+  size_t done_jmp;
+  size_t done;
+  size_t i;
+
+  if (start > ELKS_MAX16)
+    die ("text segment grew beyond 64 KiB while adding int 16h handler");
+  for (i = 0; i < 256u; i++)
+    stubs[i] = UINT32_MAX;
+
+  emit8 (text, 0x55);       /* push bp */
+  emit8 (text, 0x89);
+  emit8 (text, 0xe5);       /* mov bp, sp */
+
+  for (i = 0; i < sizeof (fns) / sizeof (fns[0]); i++)
+    {
+      emit8 (text, 0x80);
+      emit8 (text, 0xfc);
+      emit8 (text, fns[i].cmp_fn);      /* cmp ah, imm8 */
+      emit8 (text, 0x75);
+      emit8 (text, 0x06);   /* jne over call+jmp */
+      emit8 (text, 0xe8);   /* call BIOS keyboard adapter */
+      fixups[i].call_rel = text->len;
+      emit16 (text, 0);
+      emit8 (text, 0xe9);   /* jmp finish */
+      fixups[i].finish_rel = text->len;
+      emit16 (text, 0);
+    }
+
+  emit8 (text, 0x31);
+  emit8 (text, 0xc0);       /* unsupported keyboard function: ax = 0 */
+
+  finish = text->len;
+  emit8 (text, 0x85);
+  emit8 (text, 0xc0);       /* test ax, ax */
+  emit8 (text, 0x74);       /* jz set_zf */
+  set_zf = text->len;
+  emit8 (text, 0);
+  emit8 (text, 0x83);
+  emit8 (text, 0x66);
+  emit8 (text, 0x06);
+  emit8 (text, 0xbf);       /* clear ZF in saved flags */
+  emit8 (text, 0xeb);
+  done_jmp = text->len;
+  emit8 (text, 0);
+  text->data[set_zf] = (uint8_t) (text->len - (set_zf + 1u));
+  emit8 (text, 0x83);
+  emit8 (text, 0x4e);
+  emit8 (text, 0x06);
+  emit8 (text, 0x40);       /* set ZF in saved flags */
+  done = text->len;
+  text->data[done_jmp] = (uint8_t) (done - (done_jmp + 1u));
+  emit8 (text, 0x5d);       /* pop bp */
+  emit8 (text, 0xcf);       /* iret */
+
+  for (i = 0; i < sizeof (fns) / sizeof (fns[0]); i++)
+    {
+      uint8_t adapter_fn = fns[i].adapter_fn;
+      size_t stub;
+      uint16_t rel;
+
+      if (stubs[adapter_fn] == UINT32_MAX)
+        {
+          stub = text->len;
+          if (!emit_bios_keyboard_stub_for_fn (text, adapter_fn, rt))
+            die ("internal int 16h handler dispatch table mismatch");
+          if (stub > ELKS_MAX16 || text->len > ELKS_MAX16)
+            die ("text segment grew beyond 64 KiB while adding int 16h handler");
+          stubs[adapter_fn] = (uint32_t) stub;
+        }
+
+      rel = (uint16_t) (stubs[adapter_fn] - (fixups[i].call_rel + 2u));
+      put16 (text->data + fixups[i].call_rel, rel);
+      rel = (uint16_t) (finish - (fixups[i].finish_rel + 2u));
+      put16 (text->data + fixups[i].finish_rel, rel);
+    }
+
   return (uint16_t) start;
 }

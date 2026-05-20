@@ -7,8 +7,9 @@
 #   msg db 'Hi$'
 #
 # The converter should recognize the DOS console write and process exit calls
-# and produce a non-empty ELKS executable.  This does not boot ELKS; runtime
-# validation should be done on the target ELKS system.
+# and produce a non-empty ELKS executable.  The MZ path is checked through
+# explicit OS/2 NE output.  This does not boot ELKS; runtime validation should
+# be done on the target ELKS system.
 
 set -eu
 
@@ -60,7 +61,7 @@ if [ ! -s "$output" ]; then
   exit 1
 fi
 
-if ! "$converter" --verbose "$mz_input" "$mz_output" >> "$log" 2>&1; then
+if ! "$converter" --verbose --mz-output=os2 "$mz_input" "$mz_output" >> "$log" 2>&1; then
   cat "$log" >&2
   exit 1
 fi
@@ -69,7 +70,7 @@ mz_magic=$(od -An -tx1 -N2 "$mz_output" | tr -d ' \n')
 ne_magic=$(dd if="$mz_output" bs=1 skip=64 count=2 2>/dev/null \
            | od -An -tx1 | tr -d ' \n')
 if [ "$mz_magic" != 4d5a ] || [ "$ne_magic" != 4e45 ]; then
-  printf 'selftest: MZ input did not produce OS/2 NE output by default\n' >&2
+  printf 'selftest: MZ input did not produce explicit OS/2 NE output\n' >&2
   cat "$log" >&2
   exit 1
 fi

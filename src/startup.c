@@ -153,7 +153,9 @@ patch_dos_stack_switches (struct byte_vec *text, struct patch_stats *stats)
 
 static void
 append_com_argv_startup (struct image *img, int install_int21,
-                         uint16_t int21_handler)
+                         uint16_t int21_handler,
+                         const struct runtime_info *rt, int raw_keyboard,
+                         int install_int16, uint16_t int16_handler)
 {
   static const uint8_t prefix[] = {
     0x55,                   /* push bp */
@@ -217,7 +219,11 @@ append_com_argv_startup (struct image *img, int install_int21,
 
   if (install_int21)
     emit_install_int21_vector (&img->text, int21_handler);
+  if (install_int16)
+    emit_install_int16_vector (&img->text, int16_handler);
   vec_append (&img->text, prefix, sizeof (prefix));
+  if (raw_keyboard)
+    emit_stdin_raw_mode (&img->text, rt);
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding COM argv startup");
 
@@ -247,7 +253,9 @@ install_com_return_exit (struct image *img)
 
 static void
 append_mz_argv_startup (struct image *img, uint16_t original_entry,
-                        int install_int21, uint16_t int21_handler)
+                        int install_int21, uint16_t int21_handler,
+                        const struct runtime_info *rt, int raw_keyboard,
+                        int install_int16, uint16_t int16_handler)
 {
   static const uint8_t prefix[] = {
     0x55,                   /* push bp */
@@ -311,7 +319,11 @@ append_mz_argv_startup (struct image *img, uint16_t original_entry,
 
   if (install_int21)
     emit_install_int21_vector (&img->text, int21_handler);
+  if (install_int16)
+    emit_install_int16_vector (&img->text, int16_handler);
   vec_append (&img->text, prefix, sizeof (prefix));
+  if (raw_keyboard)
+    emit_stdin_raw_mode (&img->text, rt);
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding MZ argv startup");
 
@@ -345,7 +357,7 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
   uint16_t next_para;
   uint16_t limit_para;
 
-  if (data->len + 523u > ELKS_MAX16)
+  if (data->len + 529u > ELKS_MAX16)
     die ("data segment is too large for converter runtime state");
 
   rt->heap_next_off = (uint16_t) data->len;
@@ -353,12 +365,18 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
   rt->dta_off_off = (uint16_t) (data->len + 4u);
   rt->video_mode_off = (uint16_t) (data->len + 6u);
   rt->heap_base_seg_off = (uint16_t) (data->len + 8u);
-  rt->io_buf_off = (uint16_t) (data->len + 10u);
-  rt->media_id_off = (uint16_t) (data->len + 522u);
+  rt->keyboard_fd_off = (uint16_t) (data->len + 10u);
+  rt->keyboard_mode_off = (uint16_t) (data->len + 12u);
+  rt->keyboard_pending_off = (uint16_t) (data->len + 14u);
+  rt->io_buf_off = (uint16_t) (data->len + 16u);
+  rt->media_id_off = (uint16_t) (data->len + 528u);
   emit16 (data, 0);
   emit16 (data, 0);
   emit16 (data, 0x80);
   emit16 (data, 0x0003);
+  emit16 (data, 0);
+  emit16 (data, 0xffffu);
+  emit16 (data, 0);
   emit16 (data, 0);
   vec_append_zeros (data, 512u);
   emit8 (data, 0xf8);

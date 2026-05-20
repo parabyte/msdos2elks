@@ -837,6 +837,9 @@ static void
 append_ne_mz_startup (struct image *img, unsigned startup_seg,
                       unsigned target_seg, uint16_t target_off,
                       int install_int21, uint16_t int21_handler,
+                      const struct runtime_info *rt,
+                      int raw_keyboard, int install_int16,
+                      uint16_t int16_handler,
                       uint16_t psp_top_para)
 {
   static const uint8_t prefix[] = {
@@ -870,6 +873,8 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
 
   if (install_int21)
     emit_install_int21_vector (&seg->bytes, int21_handler);
+  if (install_int16)
+    emit_install_int16_vector (&seg->bytes, int16_handler);
   if (psp_top_para)
     {
       emit8 (&seg->bytes, 0x50);        /* preserve ax */
@@ -888,6 +893,8 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
       emit8 (&seg->bytes, 0x58);
     }
   vec_append (&seg->bytes, prefix, sizeof (prefix));
+  if (raw_keyboard)
+    emit_stdin_raw_mode (&seg->bytes, rt);
   if (seg->bytes.len + 5u > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
 
@@ -1107,21 +1114,31 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
         img->ne_seg[i].min_alloc = (uint16_t) img->ne_seg[i].bytes.len;
       }
 
-  if (stats->dynamic_int21)
+  if (stats->bios_keyboard_input)
+    stats->dynamic_int16 = 1;
+
+  if (stats->dynamic_int21 || stats->dynamic_int16)
     {
-      uint16_t handler = append_int21_interrupt_handler (&img->ne_seg[0].bytes,
-                                                         &rt);
+      uint16_t int21_handler = stats->dynamic_int21
+        ? append_int21_interrupt_handler (&img->ne_seg[0].bytes, &rt) : 0;
+      uint16_t int16_handler = stats->dynamic_int16
+        ? append_int16_interrupt_handler (&img->ne_seg[0].bytes, &rt) : 0;
 
       append_ne_mz_startup (img, 0, (unsigned) entry_seg,
                             ne_local_offset (&img->ne_seg[entry_seg],
                                              code_base + h->ip),
-                            1, handler, psp_top_para);
+                            stats->dynamic_int21, int21_handler,
+                            &rt,
+                            stats->bios_keyboard_input,
+                            stats->dynamic_int16, int16_handler,
+                            psp_top_para);
     }
   else
     append_ne_mz_startup (img, 0, (unsigned) entry_seg,
                           ne_local_offset (&img->ne_seg[entry_seg],
                                            code_base + h->ip),
-                          0, 0, psp_top_para);
+                          0, 0, &rt, stats->bios_keyboard_input, 0, 0,
+                          psp_top_para);
   if (img->ne_seg[0].bytes.len > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
   img->ne_seg[0].mz_len = (uint32_t) img->ne_seg[0].bytes.len;
@@ -1189,7 +1206,8 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
 
   if (opts->mz_output == MZ_OUT_OS2
       || (opts->mz_output == MZ_OUT_AUTO
-          && mz_ne_needed (data_base, text_len, data_len)))
+          && (image_len > ELKS_MAX16
+              || mz_ne_needed (data_base, text_len, data_len))))
     {
       convert_mz_ne (input, input_len, opts, img, stats, &h, exe_size,
                      code_para, data_para);
@@ -1264,14 +1282,23 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
     }
 
   patch_dos_io (&img->text, stats, &rt, &img->trel);
-  if (stats->dynamic_int21)
+  if (stats->bios_keyboard_input)
+    stats->dynamic_int16 = 1;
+  if (stats->dynamic_int21 || stats->dynamic_int16)
     {
-      uint16_t handler = append_int21_interrupt_handler (&img->text, &rt);
+      uint16_t int21_handler = stats->dynamic_int21
+        ? append_int21_interrupt_handler (&img->text, &rt) : 0;
+      uint16_t int16_handler = stats->dynamic_int16
+        ? append_int16_interrupt_handler (&img->text, &rt) : 0;
 
-      append_mz_argv_startup (img, h.ip, 1, handler);
+      append_mz_argv_startup (img, h.ip, stats->dynamic_int21, int21_handler,
+                              &rt,
+                              stats->bios_keyboard_input,
+                              stats->dynamic_int16, int16_handler);
     }
   else
-    append_mz_argv_startup (img, h.ip, 0, 0);
+    append_mz_argv_startup (img, h.ip, 0, 0, &rt,
+                            stats->bios_keyboard_input, 0, 0);
 
   if (opts->verbose)
     fprintf (stderr,

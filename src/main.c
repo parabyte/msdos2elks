@@ -43,6 +43,15 @@ has_vga_application_signature (const uint8_t *input, size_t input_len)
   return 0;
 }
 
+static int
+has_borland_cga_bgi_signature (const uint8_t *input, size_t input_len)
+{
+  return buffer_has_ascii (input, input_len,
+                           "BGI Device Driver (CGA)")
+         && buffer_has_ascii (input, input_len,
+                              "320 x 200 CGA");
+}
+
 int
 main (int argc, char **argv)
 {
@@ -76,6 +85,10 @@ main (int argc, char **argv)
 
   if (has_vga_application_signature (convert_input, convert_len))
     die ("input appears to be a VGA application; CGA, MDA, and EGA only");
+  stats.allow_bgi_multimode_video =
+    has_borland_cga_bgi_signature (convert_input, convert_len);
+  if (opts.format == FMT_EXE || (opts.format == FMT_AUTO && is_mz))
+    stats.dynamic_int21 = 1;
 
   if (opts.format == FMT_EXE || (opts.format == FMT_AUTO && is_mz))
     convert_mz (convert_input, convert_len, &opts, &img, &stats);
@@ -95,17 +108,23 @@ main (int argc, char **argv)
       if (img.os2_ne)
         fprintf (stderr,
                  "msdos2elks: patched=%u unsupported=%u dynamic-int21=%u"
+                 " dynamic-int16=%u bios-keyboard=%u"
                  " com-segment-fixes=%u stack-fixes=%u os2-ne-segs=%u\n",
                  stats.patched, stats.unsupported,
-                 stats.dynamic_int21 ? 1u : 0u, stats.com_segfix,
+                 stats.dynamic_int21 ? 1u : 0u,
+                 stats.dynamic_int16 ? 1u : 0u,
+                 stats.bios_keyboard_input ? 1u : 0u, stats.com_segfix,
                  stats.stackfix, img.ne_nsegs);
       else
         fprintf (stderr,
                  "msdos2elks: patched=%u unsupported=%u dynamic-int21=%u"
+                 " dynamic-int16=%u bios-keyboard=%u"
                  " com-segment-fixes=%u stack-fixes=%u text=%u data=%u"
                  " trel=%u drel=%u\n",
                  stats.patched, stats.unsupported,
-                 stats.dynamic_int21 ? 1u : 0u, stats.com_segfix,
+                 stats.dynamic_int21 ? 1u : 0u,
+                 stats.dynamic_int16 ? 1u : 0u,
+                 stats.bios_keyboard_input ? 1u : 0u, stats.com_segfix,
                  stats.stackfix,
                  (unsigned) img.text.len, (unsigned) img.data.len,
                  (unsigned) img.trel.len, (unsigned) img.drel.len);

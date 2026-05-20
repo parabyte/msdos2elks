@@ -77,29 +77,6 @@ pklite_has_ascii (const uint8_t *p, size_t len, const char *needle)
   return 0;
 }
 
-static int
-pklite_apply_lemmings_cga_patch (struct byte_vec *body)
-{
-  static const uint8_t loader_patch[] = { 0xe8, 0xc5, 0x04 };
-  size_t loader_off = 0x00e6u;
-  int patched = 0;
-
-  if (body->len < loader_off + sizeof (loader_patch))
-    return 0;
-  if (memcmp (body->data + loader_off, loader_patch,
-              sizeof (loader_patch)) != 0)
-    return 0;
-  if (!pklite_has_ascii (body->data, body->len,
-                         "PC Lemmings Machine Type Selection Screen")
-      || !pklite_has_ascii (body->data, body->len, "cgamain.dat"))
-    return 0;
-
-  memset (body->data + loader_off, 0x90, sizeof (loader_patch));
-  patched++;
-
-  return patched;
-}
-
 static size_t
 pklite_mz_file_size (const struct mz_header *h, size_t input_len)
 {
@@ -437,7 +414,6 @@ pklite_reveal_mz (const uint8_t *input, size_t input_len, uint8_t **out,
   uint16_t ver_code;
   int large;
   int extra;
-  int lemmings_patch;
 
   if (input_len < 0x40u || get16 (input) != MZ_MAGIC)
     return 0;
@@ -534,7 +510,6 @@ pklite_reveal_mz (const uint8_t *input, size_t input_len, uint8_t **out,
     }
 
   pklite_decode_relocs (input, exe_size, bits.pos, extra, &rels, &footer_pos);
-  lemmings_patch = pklite_apply_lemmings_cga_patch (&body);
   pklite_emit_revealed_mz (&exe, &body, &rels, minor, major,
                            get16 (input + footer_pos),
                            get16 (input + footer_pos + 2u),
@@ -548,9 +523,6 @@ pklite_reveal_mz (const uint8_t *input, size_t input_len, uint8_t **out,
              (unsigned) (major & 0x0fu), (unsigned) minor,
              large ? 1u : 0u, extra ? 1u : 0u,
              (unsigned) body.len, (unsigned) rels.len);
-  if (verbose && lemmings_patch)
-    fprintf (stderr,
-             "msdos2elks: applied Lemmings CGA loader compatibility patch\n");
 
   free (body.data);
   free (rels.data);

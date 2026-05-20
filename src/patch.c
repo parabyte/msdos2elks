@@ -77,6 +77,26 @@ record_unsupported_video (struct patch_stats *stats, uint32_t off,
   record_unsupported (stats, off, 0x10, 1, fn);
 }
 
+static int
+bgi_optional_video_probe (const struct patch_stats *stats, uint8_t fn,
+                          uint8_t mode, int mode_known)
+{
+  if (!stats->allow_bgi_multimode_video)
+    return 0;
+  if (fn == 0x30)
+    return 1;
+  if (fn != 0x00 || !mode_known)
+    return 0;
+  return mode == 0x11u || mode == 0x30u || mode == 0x40u;
+}
+
+static int
+dos_keyboard_function (uint8_t fn)
+{
+  return fn == 0x01u || fn == 0x07u || fn == 0x08u || fn == 0x0bu
+         || fn == 0x0cu;
+}
+
 static void
 patch_call (struct byte_vec *text, size_t start, size_t len, size_t target,
             int al_known, uint8_t al)
@@ -551,6 +571,75 @@ likely_explicit_unsupported_interrupt (const uint8_t *data, size_t off)
 }
 
 static void
+patch_bda_keyboard_status_checks (struct byte_vec *text,
+                                  struct patch_stats *stats,
+                                  const struct runtime_info *rt,
+                                  uint32_t *status_stub,
+                                  uint8_t *covered, size_t original_len)
+{
+  static const uint8_t pattern[] =
+  {
+    0x33, 0xdb,             /* xor bx, bx */
+    0x8e, 0xc3,             /* mov es, bx */
+    0xbb, 0x1a, 0x04,       /* mov bx, 041ah */
+    0x26, 0x8b, 0x07,       /* mov ax, es:[bx] */
+    0x33, 0xdb,             /* xor bx, bx */
+    0x8e, 0xc3,             /* mov es, bx */
+    0xbb, 0x1c, 0x04,       /* mov bx, 041ch */
+    0x26, 0x3b, 0x07,       /* cmp ax, es:[bx] */
+    0x75, 0x04,             /* jne key */
+    0x33, 0xc0,             /* xor ax, ax */
+    0xeb, 0x03,             /* jmp done */
+    0xb8, 0x01, 0x00,       /* key: mov ax, 1 */
+    0xc3                    /* done: ret */
+  };
+  size_t i;
+
+  for (i = 0; i + sizeof (pattern) <= original_len; i++)
+    {
+      size_t j;
+      uint16_t rel;
+
+      if (memcmp (text->data + i, pattern, sizeof (pattern)) != 0)
+        continue;
+      for (j = 0; j < sizeof (pattern); j++)
+        if (covered[i + j])
+          break;
+      if (j != sizeof (pattern))
+        continue;
+
+      if (*status_stub == UINT32_MAX)
+        {
+          size_t stub_off = text->len;
+
+          emit_bios_keyboard_stub_for_fn (text, 0x01, rt);
+          if (stub_off > ELKS_MAX16 || text->len > ELKS_MAX16)
+            die ("text segment grew beyond 64 KiB while adding keyboard stub");
+          *status_stub = (uint32_t) stub_off;
+        }
+
+      rel = (uint16_t) (*status_stub - (i + 3u));
+      text->data[i] = 0xe8;         /* call status_stub */
+      put16 (text->data + i + 1u, rel);
+      text->data[i + 3u] = 0x09;    /* or ax, ax */
+      text->data[i + 4u] = 0xc0;
+      text->data[i + 5u] = 0x74;    /* jz no_key */
+      text->data[i + 6u] = 0x04;
+      text->data[i + 7u] = 0xb8;    /* mov ax, 1 */
+      put16 (text->data + i + 8u, 1);
+      text->data[i + 10u] = 0xc3;   /* ret */
+      text->data[i + 11u] = 0x31;   /* no_key: xor ax, ax */
+      text->data[i + 12u] = 0xc0;
+      text->data[i + 13u] = 0xc3;   /* ret */
+      memset (text->data + i + 14u, 0x90, sizeof (pattern) - 14u);
+      for (j = 0; j < sizeof (pattern); j++)
+        covered[i + j] = 1;
+      stats->patched++;
+      stats->bios_keyboard_input = 1;
+    }
+}
+
+static void
 patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
               const struct runtime_info *rt, const struct reloc_vec *text_relocs)
 {
@@ -567,6 +656,18 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
   for (bank = 0; bank < 5u; bank++)
     for (i = 0; i < 256u; i++)
       stubs[bank][i] = UINT32_MAX;
+
+  patch_bda_keyboard_status_checks (text, stats, rt, &stubs[1][0x01],
+                                    covered, original_len);
+  if (stats->allow_bgi_multimode_video)
+    {
+      size_t stub_off = text->len;
+
+      emit_bios_no_vga_info_stub (text);
+      if (stub_off > ELKS_MAX16 || text->len > ELKS_MAX16)
+        die ("text segment grew beyond 64 KiB while adding video stub");
+      stubs[0][0x30] = (uint32_t) stub_off;
+    }
 
   for (i = 0; i + 1u < original_len; )
     {
@@ -667,6 +768,13 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
               i += insn_len;
               continue;
             }
+          if (intr == 0x16)
+            {
+              stats->bios_keyboard_input = 1;
+              stats->dynamic_int16 = 1;
+              i += insn_len;
+              continue;
+            }
           if (intr == 0x10 || intr == 0x16 || intr == 0x1a || intr == 0x33)
             {
               i += insn_len;
@@ -696,6 +804,11 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
         {
           if (!al_known || !bios_video_mode_is_ega_mda_supported (al))
             {
+              if (bgi_optional_video_probe (stats, fn, al, al_known))
+                {
+                  i += insn_len;
+                  continue;
+                }
               record_unsupported_video (stats, (uint32_t) i, fn, al,
                                         al_known);
               i += insn_len;
@@ -704,9 +817,12 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
         }
       else if (intr == 0x10 && fn == 0x30)
         {
-          record_unsupported_video (stats, (uint32_t) i, fn, 0, 0);
-          i += insn_len;
-          continue;
+          if (!bgi_optional_video_probe (stats, fn, 0, 0))
+            {
+              record_unsupported_video (stats, (uint32_t) i, fn, 0, 0);
+              i += insn_len;
+              continue;
+            }
         }
 
       if (stubs[sbank][fn] == UINT32_MAX)
@@ -736,6 +852,8 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
       for (j = start; j < start + len; j++)
         covered[j] = 1;
       stats->patched++;
+      if (intr == 0x16 || (intr == 0x21 && dos_keyboard_function (fn)))
+        stats->bios_keyboard_input = 1;
       i += insn_len;
     }
 

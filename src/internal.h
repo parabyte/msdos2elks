@@ -166,7 +166,10 @@ struct patch_stats
   unsigned patched;
   unsigned unsupported;
   int dynamic_int21;
+  int dynamic_int16;
+  int bios_keyboard_input;
   unsigned unsupported_video;
+  int allow_bgi_multimode_video;
   uint32_t first_video_offset;
   uint8_t first_video_fn;
   uint8_t first_video_mode;
@@ -184,6 +187,9 @@ struct runtime_info
   uint16_t dta_off_off;
   uint16_t video_mode_off;
   uint16_t heap_base_seg_off;
+  uint16_t keyboard_fd_off;
+  uint16_t keyboard_mode_off;
+  uint16_t keyboard_pending_off;
   uint16_t io_buf_off;
   uint16_t media_id_off;
 };
