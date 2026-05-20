@@ -29,6 +29,14 @@ subseg_input=$tmp/subseg.exe
 subseg_output=$tmp/subseg.ne
 video_input=$tmp/video.com
 video_output=$tmp/video.elks
+ega_input=$tmp/ega.com
+ega_output=$tmp/ega.elks
+mda_input=$tmp/mda.com
+mda_output=$tmp/mda.elks
+vga_input=$tmp/vga.com
+vga_output=$tmp/vga.elks
+vga_sig_input=$tmp/vgasig.com
+vga_sig_output=$tmp/vgasig.elks
 log=$tmp/converter.log
 
 printf '\264\011\272\014\001\315\041\270\000\114\315\041Hi$' > "$input"
@@ -36,6 +44,10 @@ printf '\115\132\045\000\001\000\000\000\002\000\000\000\377\377\000\000\000\001
 printf '\115\132\061\000\001\000\000\000\002\000\000\000\377\377\000\000\000\001\000\000\000\000\000\000\034\000\000\000\000\000\000\000\270\000\000\273\000\001\372\216\320\213\343\373\270\000\114\315\041' > "$stack_input"
 printf '\115\132\102\000\001\000\001\000\002\000\000\000\377\377\000\000\000\001\000\000\000\000\000\000\034\000\000\000\003\000\000\000\016\037\270\001\000\216\300\046\241\020\000\270\000\114\315\041\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\064\022' > "$subseg_input"
 printf '\270\004\000\315\020\267\001\060\333\264\013\315\020\270\000\114\315\041' > "$video_input"
+printf '\270\020\000\315\020\270\000\114\315\041' > "$ega_input"
+printf '\270\007\000\315\020\270\000\114\315\041' > "$mda_input"
+printf '\270\023\000\315\020\270\000\114\315\041' > "$vga_input"
+printf '\270\000\114\315\041vgagr0.dat' > "$vga_sig_input"
 
 if ! "$converter" --verbose "$input" "$output" > "$log" 2>&1; then
   cat "$log" >&2
@@ -87,6 +99,40 @@ if ! od -v -An -tx1 "$subseg_output" | tr -d ' \n' | grep -q '26a12000'; then
 fi
 
 if ! "$converter" --verbose "$video_input" "$video_output" >> "$log" 2>&1; then
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! "$converter" --verbose "$ega_input" "$ega_output" >> "$log" 2>&1; then
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! "$converter" --verbose "$mda_input" "$mda_output" >> "$log" 2>&1; then
+  cat "$log" >&2
+  exit 1
+fi
+
+if "$converter" --verbose "$vga_input" "$vga_output" >> "$log" 2>&1; then
+  printf 'selftest: VGA mode 13h input converted unexpectedly\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! grep -q 'VGA/non-CGA-EGA-MDA video mode 13h' "$log"; then
+  printf 'selftest: VGA rejection diagnostic missing\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if "$converter" --verbose "$vga_sig_input" "$vga_sig_output" >> "$log" 2>&1; then
+  printf 'selftest: VGA resource signature input converted unexpectedly\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! grep -q 'input appears to be a VGA application' "$log"; then
+  printf 'selftest: VGA resource signature diagnostic missing\n' >&2
   cat "$log" >&2
   exit 1
 fi

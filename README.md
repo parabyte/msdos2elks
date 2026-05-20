@@ -26,8 +26,10 @@ Enable OS/2 executable support in ELKS before running converted `.EXE` outputs:
 in upstream ELKS, run `make menuconfig`, open `Executable file formats`, enable
 `Support OS/2 executables`, save, and rebuild.  This sets `CONFIG_EXEC_OS2=y`.
 
-For packed DOS inputs, use the unpack helper.  It tries a direct conversion
-first, then uses locally available unpackers before retrying the converter:
+PKLITE MZ inputs supported by the built-in revealer are converted directly.
+For other packed DOS inputs, use the unpack helper.  It tries a direct
+conversion first, then uses locally available unpackers before retrying the
+converter:
 
 ```sh
 ./unpack-and-convert.sh packed-or-sfx.exe program
@@ -155,6 +157,14 @@ too small to replace in place, startup installs a process-local `int 21h`
 handler in the real-mode interrupt vector table so shared DOS wrappers can
 dispatch through the same ELKS adapters.
 
+BIOS video conversion is intentionally limited to CGA, MDA, and EGA class
+modes.  Static mode-set calls for MDA text mode 07h and EGA graphics modes
+0Dh-10h are allowed and passed through to the machine BIOS.  Static VGA modes
+11h-13h, later modes, and VGA/MCGA-only BIOS services are refused in strict
+mode so a VGA program is not converted into a misleading ELKS binary.  Known
+VGA-only loader/resource signatures are also refused after any supported
+PKLITE reveal.
+
 Supported DOS functions:
 
 ```text
@@ -193,19 +203,17 @@ int 10h AH=00h,01h,02h,05h,06h,07h
               video mode/cursor/page and scroll compatibility; mode set calls
               record the mode and pass through to BIOS for real hardware setup
 int 10h AH=03h,08h,0Fh,1Ah
-              cursor/video mode/read char/display info stubs
+              cursor/read char stubs, BIOS video-mode query passthrough,
+              no-VGA display info stub
 int 10h AH=09h,0Ah,0Eh
-              text character output to stdout
+              BIOS text/teletype passthrough for text-mode and title-screen
+              rendering
 int 10h AH=0Ch,0Dh
-              mode 13h direct A000h pixel write/read with BIOS fallback
-int 10h AH=0Bh,12h,30h
-              palette/EGA/VGA compatibility stubs
-int 16h AH=00h,10h
-              blocking read of one stdin byte
-int 16h AH=01h,11h
-              nonblocking status, reports no key with ZF set
-int 16h AH=02h,12h
-              keyboard shift flags, zero-result stubs
+              BIOS pixel write/read passthrough for CGA/EGA graphics modes
+int 10h AH=0Bh,12h
+              palette and EGA alternate-select/query BIOS passthrough
+int 16h AH=00h,01h,02h,10h,11h,12h
+              stdin-backed blocking reads, no-key status, shift-flag stubs
 int 1Ah AH=00h,01h,02h,04h
               deterministic clock/date compatibility stubs
 ```
@@ -266,18 +274,24 @@ values at or above `0xfff0` are saturated to ELKS' maximum-heap request value
 `0xfff0`.  If the resulting text or data segment cannot fit in 16 bits, the
 conversion fails instead of truncating.
 
-The DOS memory allocator compatibility stub manages paragraph allocations inside
-the ELKS data segment.  Allocation size is in 16-byte paragraphs.  Successful
-`AH=48h` returns a segment value derived from the process `DS`; `AH=49h` and
-`AH=4Ah` currently succeed without compaction.  Allocation failure returns DOS
-error `8` and the largest available paragraph count in `BX`.
+The DOS memory allocator compatibility stub manages paragraph allocations in
+the ELKS data segment for small DOS requests.  Allocation size is in 16-byte
+paragraphs.  Successful `AH=48h` returns a segment value derived from the
+process `DS`; `AH=49h` and `AH=4Ah` currently succeed without compaction.
+Large MZ games that request a conventional-memory arena above one native
+segment use ELKS far-memory allocation instead, with disk reads bounced through
+the runtime stack segment when ELKS requires syscall buffers to match the exact
+segment base.  Allocation failure returns DOS error `8` and the largest
+available paragraph count in `BX`.
 
 ## Packed Inputs
 
 Packed binaries are not converted while still packed.  The packed entry stub is
-the wrong program to translate, so `msdos2elks` rejects known LZEXE, PKLITE,
-EXEPACK/LZ-style, ZIP/SFX, and compressed installer signatures.  Use
-`unpack-and-convert.sh` when the input may be packed:
+the wrong program to translate, so `msdos2elks` first reveals supported PKLITE
+MZ inputs to a plain in-memory MZ image and converts that image.  Other known
+LZEXE, EXEPACK/LZ-style, ZIP/SFX, and compressed installer signatures are
+rejected.  Use `unpack-and-convert.sh` when the input may use a packer that is
+not handled internally:
 
 ```sh
 ./unpack-and-convert.sh game.exe game
@@ -288,12 +302,12 @@ MSDOS2ELKS_UNPACK_CMD='my-unpacker "$MSDOS2ELKS_INPUT" "$MSDOS2ELKS_OUTPUT"' \
 
 The helper tries the converter directly first, recursively extracts ZIP/SFX
 payloads with `unzip` or `7z`, runs available `upx`, `unlzexe`, and `unp`
-tools, and then retries every produced `.EXE`/`.COM`.  LZEXE and PKLITE are
-handled with `gamecomp` when available; if `npm` and `node` are present, the
-helper can also run `@camoto/gamecomp` directly for LZEXE and a temporary
-patched copy for the old PKLITE 1.03 extra-compression relocation terminator
-used by titles such as Lemmings.  Set `MSDOS2ELKS_UNPACK_NPM_GAMECOMP=0` to
-disable that npm-backed path.
+tools, and then retries every produced `.EXE`/`.COM`.  LZEXE and unsupported
+PKLITE variants can still be handled with `gamecomp` when available; if `npm`
+and `node` are present, the helper can also run `@camoto/gamecomp` directly for
+LZEXE and a temporary patched copy for the old PKLITE 1.03 extra-compression
+relocation terminator used by titles such as Lemmings.  Set
+`MSDOS2ELKS_UNPACK_NPM_GAMECOMP=0` to disable that npm-backed path.
 Custom unpack hooks remain available for packers that need separate licensed or
 locally supplied tools.  If no unpacker produces a plain DOS image, conversion
 fails rather than emitting a fake ELKS executable.
@@ -339,7 +353,10 @@ data segment, stack, argv copy, and heap inside one 64 KiB segment.  Explicit
 if they cannot be represented.
 
 This is the path used for large pre-1992 MZ games such as Lemmings after
-PKLITE unpacking.  It removes the previous flat-converter failure where the DOS
-data segment started beyond the first 64K.  Runtime validation for NE binaries
-must be done inside ELKS or on real hardware; `elksemu` only accepts ELKS
-Minix a.out binaries and reports NE files as not being ELKS binaries.
+PKLITE reveal.  It removes the previous flat-converter failure where the DOS
+data segment started beyond the first 64K.  Large games may need an ELKS boot
+profile with less kernel heap and cache pressure so `fmemalloc` can satisfy
+their DOS arena request; for example, Lemmings CGA was validated with
+`task=6 buf=8 cache=4 file=20 inode=24 heap=15000`.  Runtime validation for NE
+binaries must be done inside ELKS or on real hardware; `elksemu` only accepts
+ELKS Minix a.out binaries and reports NE files as not being ELKS binaries.

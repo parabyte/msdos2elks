@@ -14,6 +14,7 @@
 #include "src/patch.c"
 #include "src/startup.c"
 #include "src/com.c"
+#include "src/pklite.c"
 #include "src/mz_os2.c"
 #include "src/output.c"
 #include "src/main.c"

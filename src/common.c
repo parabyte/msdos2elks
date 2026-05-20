@@ -90,6 +90,15 @@ emit32 (struct byte_vec *v, uint32_t l)
   emit16 (v, (uint16_t) (l >> 16));
 }
 
+static int
+bios_video_mode_is_ega_mda_supported (uint8_t mode)
+{
+  mode &= 0x7fu;            /* bit 7 requests no clear on EGA/VGA BIOSes. */
+  if (mode <= 0x07u)
+    return 1;               /* CGA text/graphics plus MDA mode 7. */
+  return mode >= 0x0du && mode <= 0x10u; /* EGA graphics modes. */
+}
+
 static void
 reloc_add (struct reloc_vec *v, uint32_t addr, uint16_t sym)
 {
@@ -140,4 +149,3 @@ ne_reloc_add (struct ne_reloc_vec *v, uint16_t src_chain, uint8_t src_type,
   v->data[v->len].offset = offset;
   v->len++;
 }
-

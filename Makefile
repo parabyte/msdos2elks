@@ -19,6 +19,7 @@ MODULES = \
 	src/patch.c \
 	src/startup.c \
 	src/com.c \
+	src/pklite.c \
 	src/mz_os2.c \
 	src/output.c \
 	src/main.c

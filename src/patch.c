@@ -1,5 +1,6 @@
 #include "internal.h"
 
+static void
 record_unsupported (struct patch_stats *stats, uint32_t offset, uint8_t intr,
                     int known, uint8_t fn)
 {
@@ -18,6 +19,22 @@ static void
 report_unsupported (const struct patch_stats *stats)
 {
   unsigned i;
+
+  if (stats->unsupported_video)
+    {
+      if (stats->first_video_mode_known)
+        fprintf (stderr,
+                 "msdos2elks: unsupported VGA/non-CGA-EGA-MDA video mode"
+                 " %02xh at text offset %04x\n",
+                 stats->first_video_mode,
+                 (unsigned) stats->first_video_offset);
+      else
+        fprintf (stderr,
+                 "msdos2elks: unsupported dynamic BIOS video mode/service"
+                 " AH=%02xh at text offset %04x; refusing possible VGA app\n",
+                 stats->first_video_fn,
+                 (unsigned) stats->first_video_offset);
+    }
 
   for (i = 0; i < stats->first_len; i++)
     {
@@ -46,19 +63,36 @@ report_unsupported (const struct patch_stats *stats)
 }
 
 static void
+record_unsupported_video (struct patch_stats *stats, uint32_t off,
+                          uint8_t fn, uint8_t mode, int mode_known)
+{
+  if (stats->unsupported_video == 0)
+    {
+      stats->first_video_offset = off;
+      stats->first_video_fn = fn;
+      stats->first_video_mode = mode;
+      stats->first_video_mode_known = mode_known;
+    }
+  stats->unsupported_video++;
+  record_unsupported (stats, off, 0x10, 1, fn);
+}
+
+static void
 patch_call (struct byte_vec *text, size_t start, size_t len, size_t target,
             int al_known, uint8_t al)
 {
   uint16_t rel;
   size_t i;
 
-  if (al_known && len == 5u)
+  if (al_known && len >= 5u)
     {
       rel = (uint16_t) (target - (start + 5u));
       text->data[start] = 0xb0;         /* mov al, imm8 */
       text->data[start + 1u] = al;
       text->data[start + 2u] = 0xe8;    /* call rel16 */
       put16 (text->data + start + 3u, rel);
+      for (i = 5u; i < len; i++)
+        text->data[start + i] = 0x90;
       return;
     }
 
@@ -116,8 +150,11 @@ movable_instruction_len (const uint8_t *p, size_t avail)
   op = p[0];
 
   if (op == 0x26 || op == 0x2e || op == 0x36 || op == 0x3e
+      || op == 0x64 || op == 0x65 || op == 0x66 || op == 0x67
       || op == 0xf2 || op == 0xf3)
     {
+      if (op == 0x66 && avail >= 2u && p[1] == 0x68)
+        return avail >= 6u ? 6u : 0;
       size_t n = movable_instruction_len (p + 1u, avail - 1u);
       return n ? n + 1u : 0;
     }
@@ -402,8 +439,11 @@ scan_instruction_len (const uint8_t *p, size_t avail)
     return 0;
   op = p[0];
   if (op == 0xf0 || op == 0xf2 || op == 0xf3 || op == 0x26
-      || op == 0x2e || op == 0x36 || op == 0x3e)
+      || op == 0x2e || op == 0x36 || op == 0x3e
+      || op == 0x64 || op == 0x65 || op == 0x66 || op == 0x67)
     {
+      if (op == 0x66 && avail >= 2u && p[1] == 0x68)
+        return avail >= 6u ? 6u : 1u;
       n = scan_instruction_len (p + 1u, avail - 1u);
       return n ? n + 1u : 1u;
     }
@@ -500,6 +540,16 @@ is_reported_interrupt (uint8_t intr)
     }
 }
 
+static int
+likely_explicit_unsupported_interrupt (const uint8_t *data, size_t off)
+{
+  if (off >= 2u && data[off - 2u] == 0xb4)
+    return 1;
+  if (off >= 3u && data[off - 3u] == 0xb8)
+    return 1;
+  return 0;
+}
+
 static void
 patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
               const struct runtime_info *rt, const struct reloc_vec *text_relocs)
@@ -549,7 +599,9 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
               i += insn_len;
               continue;
             }
-          if (is_reported_interrupt (intr))
+          if (is_reported_interrupt (intr)
+              && (intr == 0x29
+                  || likely_explicit_unsupported_interrupt (text->data, i)))
             record_unsupported (stats, (uint32_t) i, intr, 0, 0);
           i += insn_len;
           continue;
@@ -576,6 +628,15 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
           start = i - 2u;
           len = 4u;
           fn = 0;
+        }
+      else if (i >= 4u && text->data[i - 4u] == 0xb0
+               && text->data[i - 2u] == 0xb4)
+        {
+          start = i - 4u;
+          len = 6u;
+          al = text->data[i - 3u];
+          al_known = 1;
+          fn = text->data[i - 1u];
         }
       else if (i >= 2u && text->data[i - 2u] == 0xb4)
         {
@@ -627,6 +688,23 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
         }
       if (!len)
         {
+          i += insn_len;
+          continue;
+        }
+
+      if (intr == 0x10 && fn == 0x00)
+        {
+          if (!al_known || !bios_video_mode_is_ega_mda_supported (al))
+            {
+              record_unsupported_video (stats, (uint32_t) i, fn, al,
+                                        al_known);
+              i += insn_len;
+              continue;
+            }
+        }
+      else if (intr == 0x10 && fn == 0x30)
+        {
+          record_unsupported_video (stats, (uint32_t) i, fn, 0, 0);
           i += insn_len;
           continue;
         }

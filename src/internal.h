@@ -13,8 +13,9 @@
  *
  * Conversion happens in conservative phases:
  *
- *   1. identify the input shape and reject packed images that must be
- *      unpacked before the real program can be inspected;
+ *   1. identify the input shape, reveal supported packed MZ images, and
+ *      reject packed images that must still be unpacked before the real
+ *      program can be inspected;
  *   2. construct ELKS text/data layout, relocation records, startup code, PSP
  *      compatible command-tail state, and DOS-style memory scratch space;
  *   3. replace statically proven DOS/BIOS I/O interrupt sites with near calls
@@ -165,6 +166,11 @@ struct patch_stats
   unsigned patched;
   unsigned unsupported;
   int dynamic_int21;
+  unsigned unsupported_video;
+  uint32_t first_video_offset;
+  uint8_t first_video_fn;
+  uint8_t first_video_mode;
+  int first_video_mode_known;
   unsigned com_segfix;
   unsigned stackfix;
   struct unsupported_site first[16];
@@ -177,6 +183,9 @@ struct runtime_info
   uint16_t heap_limit_off;
   uint16_t dta_off_off;
   uint16_t video_mode_off;
+  uint16_t heap_base_seg_off;
+  uint16_t io_buf_off;
+  uint16_t media_id_off;
 };
 
 struct mz_header
@@ -218,5 +227,7 @@ struct mz_imm_store
   int32_t disp;
 };
 
+static int pklite_reveal_mz (const uint8_t *input, size_t input_len,
+                             uint8_t **out, size_t *out_len, int verbose);
 
 #endif /* MSDOS2ELKS_INTERNAL_H */

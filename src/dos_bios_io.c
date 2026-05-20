@@ -62,13 +62,6 @@ emit_success_stub (struct byte_vec *v)
 }
 
 static void
-emit_clear_carry_stub (struct byte_vec *v)
-{
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
-}
-
-static void
 emit_fail_stub (struct byte_vec *v)
 {
   emit8 (v, 0xb8);
@@ -192,10 +185,58 @@ emit_select_drive_stub (struct byte_vec *v)
 static void
 emit_get_vector_stub (struct byte_vec *v)
 {
+  emit8 (v, 0x50);          /* push ax */
   emit8 (v, 0x1e);          /* push ds */
-  emit8 (v, 0x07);          /* pop es */
+  emit8 (v, 0x88);
+  emit8 (v, 0xc3);          /* bl = al */
+  emit8 (v, 0x30);
+  emit8 (v, 0xff);          /* bh = 0 */
+  emit8 (v, 0xd1);
+  emit8 (v, 0xe3);          /* bx *= 2 */
+  emit8 (v, 0xd1);
+  emit8 (v, 0xe3);          /* bx *= 4 */
   emit8 (v, 0x31);
-  emit8 (v, 0xdb);          /* bx = 0 */
+  emit8 (v, 0xc0);          /* ax = 0 */
+  emit8 (v, 0x8e);
+  emit8 (v, 0xd8);          /* ds = IVT segment */
+  emit8 (v, 0xc4);
+  emit8 (v, 0x1f);          /* les bx, [bx] */
+  emit8 (v, 0x1f);          /* pop ds */
+  emit8 (v, 0x58);          /* pop ax */
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_set_vector_stub (struct byte_vec *v)
+{
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x06);          /* push es */
+  emit8 (v, 0x88);
+  emit8 (v, 0xc3);          /* bl = al */
+  emit8 (v, 0x30);
+  emit8 (v, 0xff);          /* bh = 0 */
+  emit8 (v, 0xd1);
+  emit8 (v, 0xe3);          /* bx *= 2 */
+  emit8 (v, 0xd1);
+  emit8 (v, 0xe3);          /* bx *= 4 */
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);          /* ax = 0 */
+  emit8 (v, 0x8e);
+  emit8 (v, 0xc0);          /* es = IVT segment */
+  emit8 (v, 0xfa);          /* cli */
+  emit8 (v, 0x26);
+  emit8 (v, 0x89);
+  emit8 (v, 0x17);          /* es:[bx] = dx */
+  emit8 (v, 0x26);
+  emit8 (v, 0x8c);
+  emit8 (v, 0x5f);
+  emit8 (v, 0x02);          /* es:[bx+2] = ds */
+  emit8 (v, 0xfb);          /* sti */
+  emit8 (v, 0x07);          /* pop es */
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0x58);          /* pop ax */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
@@ -211,6 +252,24 @@ emit_get_disk_free_stub (struct byte_vec *v)
   emit16 (v, 512);          /* bytes per sector */
   emit8 (v, 0xba);
   emit16 (v, 0x1000);       /* total clusters */
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_get_allocation_info_stub (struct byte_vec *v,
+                               const struct runtime_info *rt)
+{
+  emit8 (v, 0xb8);
+  emit16 (v, 1);            /* AL = sectors per cluster */
+  emit8 (v, 0xb9);
+  emit16 (v, 512);          /* bytes per sector */
+  emit8 (v, 0xba);
+  emit16 (v, 0x1000);       /* clusters */
+  emit8 (v, 0xbb);
+  emit16 (v, rt->media_id_off);
+  emit8 (v, 0x16);
+  emit8 (v, 0x1f);          /* DS:BX = media ID byte */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
@@ -322,11 +381,25 @@ emit_find_first_stub (struct byte_vec *v, const struct runtime_info *rt)
 static void
 emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
 {
+  size_t fmem_pos;
+  size_t overlarge_pos;
+  size_t query_pos;
   size_t ja_pos;
   size_t fail_pos;
+  size_t sys_fail_pos;
 
+  emit8 (v, 0x53);          /* push bx */
   emit8 (v, 0x51);          /* push cx */
   emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x8b);
+  emit8 (v, 0x16);
+  emit16 (v, rt->heap_base_seg_off);
+  emit8 (v, 0x83);
+  emit8 (v, 0xfa);
+  emit8 (v, 0xff);          /* cmp dx, 0ffffh */
+  emit8 (v, 0x74);          /* je fmemalloc */
+  fmem_pos = v->len;
+  emit8 (v, 0);
   emit8 (v, 0x8b);
   emit8 (v, 0x0e);
   emit16 (v, rt->heap_next_off);
@@ -349,12 +422,20 @@ emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0x89);
   emit8 (v, 0x0e);
   emit16 (v, rt->heap_next_off);
+  emit8 (v, 0x8b);
+  emit8 (v, 0x16);
+  emit16 (v, rt->heap_base_seg_off);
+  emit8 (v, 0x09);
+  emit8 (v, 0xd2);          /* or dx, dx */
+  emit8 (v, 0x75);
+  emit8 (v, 0x02);          /* jnz have_base */
   emit8 (v, 0x8c);
   emit8 (v, 0xda);          /* dx = ds */
   emit8 (v, 0x01);
-  emit8 (v, 0xd0);          /* ax += ds */
+  emit8 (v, 0xd0);          /* ax += allocation base segment */
   emit8 (v, 0x5a);
   emit8 (v, 0x59);
+  emit8 (v, 0x5b);
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
   fail_pos = v->len;
@@ -364,9 +445,137 @@ emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit16 (v, 8);            /* insufficient memory */
   emit8 (v, 0x5a);
   emit8 (v, 0x59);
+  emit8 (v, 0x83);
+  emit8 (v, 0xc4);
+  emit8 (v, 0x02);          /* discard saved bx */
   emit8 (v, 0xf9);
   emit8 (v, 0xc3);
   v->data[ja_pos] = (uint8_t) (fail_pos - (ja_pos + 1u));
+
+  v->data[fmem_pos] = (uint8_t) (v->len - (fmem_pos + 1u));
+  emit8 (v, 0x83);
+  emit8 (v, 0xfb);
+  emit8 (v, 0xff);          /* cmp bx, 0ffffh */
+  emit8 (v, 0x74);          /* je query_largest */
+  query_pos = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->heap_limit_off);       /* cmp bx, largest advertised */
+  emit8 (v, 0x77);                      /* ja overlarge_probe */
+  overlarge_pos = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xc7);
+  emit8 (v, 0x06);
+  emit16 (v, rt->heap_next_off);
+  emit16 (v, 0);            /* clear output segment word */
+  emit8 (v, 0xb9);
+  emit16 (v, rt->heap_next_off);
+  emit8 (v, 0xb8);
+  emit16 (v, 82);           /* fmemalloc */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);          /* test ax, ax */
+  emit8 (v, 0x78);          /* js sys_fail */
+  sys_fail_pos = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xa1);
+  emit16 (v, rt->heap_next_off);        /* ax = allocated segment */
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x5b);
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+  v->data[sys_fail_pos] = (uint8_t) (v->len - (sys_fail_pos + 1u));
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->heap_limit_off);
+  emit8 (v, 0xb8);
+  emit16 (v, 8);            /* insufficient memory */
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x83);
+  emit8 (v, 0xc4);
+  emit8 (v, 0x02);          /* discard saved bx */
+  emit8 (v, 0xf9);
+  emit8 (v, 0xc3);
+
+  v->data[overlarge_pos] = (uint8_t) (v->len - (overlarge_pos + 1u));
+  emit8 (v, 0xb8);
+  emit16 (v, 0x1000u);      /* transient probe segment, not a real arena */
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x5b);
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+
+  v->data[query_pos] = (uint8_t) (v->len - (query_pos + 1u));
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->heap_limit_off);
+  emit8 (v, 0xb8);
+  emit16 (v, 8);            /* DOS reports largest block with CF set */
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x83);
+  emit8 (v, 0xc4);
+  emit8 (v, 0x02);          /* discard saved bx */
+  emit8 (v, 0xf9);
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_free_stub (struct byte_vec *v, const struct runtime_info *rt)
+{
+  size_t success_from_not_fmem;
+  size_t success_from_fake;
+  size_t fail_pos;
+
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x8b);
+  emit8 (v, 0x16);
+  emit16 (v, rt->heap_base_seg_off);
+  emit8 (v, 0x83);
+  emit8 (v, 0xfa);
+  emit8 (v, 0xff);          /* cmp dx, 0ffffh */
+  emit8 (v, 0x75);          /* jne success */
+  success_from_not_fmem = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x06);          /* push es */
+  emit8 (v, 0x5b);          /* bx = segment to free */
+  emit8 (v, 0x81);
+  emit8 (v, 0xfb);
+  emit16 (v, 0x1000u);
+  emit8 (v, 0x74);          /* fake probe segment */
+  success_from_fake = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xb8);
+  emit16 (v, 83);           /* fmemfree */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);
+  emit8 (v, 0x78);          /* js fail */
+  fail_pos = v->len;
+  emit8 (v, 0);
+  v->data[success_from_not_fmem] =
+    (uint8_t) (v->len - (success_from_not_fmem + 1u));
+  v->data[success_from_fake] = (uint8_t) (v->len - (success_from_fake + 1u));
+  emit8 (v, 0x5a);
+  emit8 (v, 0x5b);
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+  v->data[fail_pos] = (uint8_t) (v->len - (fail_pos + 1u));
+  emit8 (v, 0xf7);
+  emit8 (v, 0xd8);
+  emit8 (v, 0x5a);
+  emit8 (v, 0x5b);
+  emit8 (v, 0xf9);
+  emit8 (v, 0xc3);
 }
 
 static void
@@ -459,6 +668,167 @@ emit_readwrite_stub (struct byte_vec *v, uint16_t nr)
 }
 
 static void
+emit_read_stub (struct byte_vec *v, const struct runtime_info *rt)
+{
+  size_t far_pos;
+  size_t loop_pos;
+  size_t done_from_empty;
+  size_t chunk_ok_from_jbe;
+  size_t error_from_js;
+  size_t done_from_zero;
+  size_t done_from_short;
+  size_t loop_from_jmp;
+  size_t done_pos;
+  size_t error_pos;
+  uint16_t rel;
+
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x8c);
+  emit8 (v, 0xd8);          /* ax = ds */
+  emit8 (v, 0x8c);
+  emit8 (v, 0xd2);          /* dx = ss */
+  emit8 (v, 0x39);
+  emit8 (v, 0xd0);          /* cmp ax, dx */
+  emit8 (v, 0x5a);
+  emit8 (v, 0x58);
+  emit8 (v, 0x75);          /* jne far_path */
+  far_pos = v->len;
+  emit8 (v, 0);
+  emit_readwrite_stub (v, 3);
+
+  v->data[far_pos] = (uint8_t) (v->len - (far_pos + 1u));
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x56);          /* push si */
+  emit8 (v, 0x57);          /* push di */
+  emit8 (v, 0x55);          /* push bp */
+  emit8 (v, 0x1e);          /* push ds */
+  emit8 (v, 0x06);          /* push es */
+  emit8 (v, 0x1e);
+  emit8 (v, 0x07);          /* es = destination ds */
+  emit8 (v, 0x89);
+  emit8 (v, 0xd7);          /* di = destination offset */
+  emit8 (v, 0x31);
+  emit8 (v, 0xed);          /* bp = total bytes read */
+
+  loop_pos = v->len;
+  emit8 (v, 0x09);
+  emit8 (v, 0xc9);          /* or cx, cx */
+  emit8 (v, 0x74);          /* jz done */
+  done_from_empty = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x89);
+  emit8 (v, 0xca);          /* dx = remaining */
+  emit8 (v, 0x81);
+  emit8 (v, 0xfa);
+  emit16 (v, 512u);         /* cmp dx, 512 */
+  emit8 (v, 0x76);          /* jbe chunk_ok */
+  chunk_ok_from_jbe = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xba);
+  emit16 (v, 512u);         /* dx = chunk */
+  v->data[chunk_ok_from_jbe] =
+    (uint8_t) (v->len - (chunk_ok_from_jbe + 1u));
+
+  emit8 (v, 0x51);          /* push remaining */
+  emit8 (v, 0x52);          /* push chunk */
+  emit8 (v, 0x53);          /* push fd */
+  emit8 (v, 0x06);          /* push destination segment */
+  emit8 (v, 0x57);          /* push destination offset */
+  emit8 (v, 0x55);          /* push total */
+  emit8 (v, 0xb9);
+  emit16 (v, rt->io_buf_off);
+  emit8 (v, 0x16);
+  emit8 (v, 0x1f);          /* ds = ss */
+  emit8 (v, 0xb8);
+  emit16 (v, 3);            /* read */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x5d);          /* pop total */
+  emit8 (v, 0x5f);          /* pop destination offset */
+  emit8 (v, 0x07);          /* pop destination segment */
+  emit8 (v, 0x5b);          /* pop fd */
+  emit8 (v, 0x5a);          /* pop chunk */
+  emit8 (v, 0x59);          /* pop remaining */
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);          /* test ax, ax */
+  emit8 (v, 0x78);          /* js error */
+  error_from_js = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x09);
+  emit8 (v, 0xc0);          /* or ax, ax */
+  emit8 (v, 0x74);          /* jz done */
+  done_from_zero = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x51);          /* push remaining */
+  emit8 (v, 0x50);          /* push actual */
+  emit8 (v, 0x89);
+  emit8 (v, 0xc1);          /* cx = actual */
+  emit8 (v, 0xbe);
+  emit16 (v, rt->io_buf_off);
+  emit8 (v, 0x16);
+  emit8 (v, 0x1f);          /* ds = ss */
+  emit8 (v, 0xfc);          /* cld */
+  emit8 (v, 0xf3);
+  emit8 (v, 0xa4);          /* rep movsb */
+  emit8 (v, 0x58);          /* pop actual */
+  emit8 (v, 0x59);          /* pop remaining */
+  emit8 (v, 0x01);
+  emit8 (v, 0xc5);          /* bp += actual */
+  emit8 (v, 0x29);
+  emit8 (v, 0xc1);          /* remaining -= actual */
+  emit8 (v, 0x39);
+  emit8 (v, 0xd0);          /* cmp ax, chunk */
+  emit8 (v, 0x72);          /* jb done */
+  done_from_short = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xeb);          /* jmp loop */
+  loop_from_jmp = v->len;
+  emit8 (v, 0);
+
+  done_pos = v->len;
+  emit8 (v, 0x89);
+  emit8 (v, 0xe8);          /* ax = total */
+  emit8 (v, 0x07);
+  emit8 (v, 0x1f);
+  emit8 (v, 0x5d);
+  emit8 (v, 0x5f);
+  emit8 (v, 0x5e);
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x5b);
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+
+  error_pos = v->len;
+  emit8 (v, 0x09);
+  emit8 (v, 0xed);          /* or bp, bp */
+  emit8 (v, 0x75);          /* jnz done */
+  rel = (uint16_t) (done_pos - (v->len + 1u));
+  emit8 (v, (uint8_t) rel);
+  emit8 (v, 0xf7);
+  emit8 (v, 0xd8);          /* ax = positive errno */
+  emit8 (v, 0x07);
+  emit8 (v, 0x1f);
+  emit8 (v, 0x5d);
+  emit8 (v, 0x5f);
+  emit8 (v, 0x5e);
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x5b);
+  emit8 (v, 0xf9);
+  emit8 (v, 0xc3);
+
+  v->data[done_from_empty] = (uint8_t) (done_pos - (done_from_empty + 1u));
+  v->data[error_from_js] = (uint8_t) (error_pos - (error_from_js + 1u));
+  v->data[done_from_zero] = (uint8_t) (done_pos - (done_from_zero + 1u));
+  v->data[done_from_short] = (uint8_t) (done_pos - (done_from_short + 1u));
+  v->data[loop_from_jmp] = (uint8_t) (loop_pos - (loop_from_jmp + 1u));
+}
+
+static void
 emit_write_char_stub (struct byte_vec *v)
 {
   size_t js_pos;
@@ -519,7 +889,7 @@ emit_direct_console_stub (struct byte_vec *v)
 }
 
 static void
-emit_read_char_stub (struct byte_vec *v, int echo)
+emit_read_char_stub (struct byte_vec *v, int echo, int bios_key)
 {
   size_t js_pos;
   size_t err_pos;
@@ -562,6 +932,23 @@ emit_read_char_stub (struct byte_vec *v, int echo)
   emit8 (v, 0x8a);
   emit8 (v, 0x46);
   emit8 (v, 0x00);          /* al = [bp] */
+  if (bios_key)
+    {
+      emit8 (v, 0x30);
+      emit8 (v, 0xe4);      /* ah = 0 for unknown scan code */
+      emit8 (v, 0x3c);
+      emit8 (v, 0x0a);      /* map ELKS newline to DOS carriage return */
+      emit8 (v, 0x75);
+      emit8 (v, 0x02);
+      emit8 (v, 0xb0);
+      emit8 (v, 0x0d);
+      emit8 (v, 0x3c);
+      emit8 (v, 0x0d);
+      emit8 (v, 0x75);
+      emit8 (v, 0x02);
+      emit8 (v, 0xb4);
+      emit8 (v, 0x1c);      /* Enter scan code */
+    }
   emit8 (v, 0x83);
   emit8 (v, 0xc4);
   emit8 (v, 0x02);          /* discard temp */
@@ -583,77 +970,6 @@ emit_read_char_stub (struct byte_vec *v, int echo)
 }
 
 static void
-emit_bios_write_al_stub (struct byte_vec *v, int count_from_cx)
-{
-  size_t jz_pos;
-  size_t done_pos;
-  size_t loop_pos;
-  size_t jnz_pos;
-
-  emit8 (v, 0x50);          /* save ax */
-  emit8 (v, 0x53);
-  emit8 (v, 0x51);
-  emit8 (v, 0x52);
-  emit8 (v, 0x57);
-  emit8 (v, 0x50);          /* stack byte to write */
-  if (count_from_cx)
-    {
-      emit8 (v, 0x89);
-      emit8 (v, 0xcf);      /* di = cx */
-    }
-  else
-    {
-      emit8 (v, 0xbf);
-      emit16 (v, 1);        /* di = 1 */
-    }
-  emit8 (v, 0x85);
-  emit8 (v, 0xff);          /* test di, di */
-  emit8 (v, 0x74);
-  jz_pos = v->len;
-  emit8 (v, 0);
-  loop_pos = v->len;
-  emit8 (v, 0xbb);
-  emit16 (v, 1);            /* stdout */
-  emit8 (v, 0x89);
-  emit8 (v, 0xe1);          /* cx = sp */
-  emit8 (v, 0xba);
-  emit16 (v, 1);
-  emit8 (v, 0xb8);
-  emit16 (v, 4);            /* write */
-  emit8 (v, 0xcd);
-  emit8 (v, 0x80);
-  emit8 (v, 0x4f);          /* dec di */
-  emit8 (v, 0x75);
-  jnz_pos = v->len;
-  emit8 (v, 0);
-  done_pos = v->len;
-  emit8 (v, 0x83);
-  emit8 (v, 0xc4);
-  emit8 (v, 0x02);          /* discard stack byte */
-  emit8 (v, 0x5f);
-  emit8 (v, 0x5a);
-  emit8 (v, 0x59);
-  emit8 (v, 0x5b);
-  emit8 (v, 0x58);
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
-
-  v->data[jz_pos] = (uint8_t) (done_pos - (jz_pos + 1u));
-  v->data[jnz_pos] = (uint8_t) (loop_pos - (jnz_pos + 1u));
-}
-
-static void
-emit_bios_get_cursor_stub (struct byte_vec *v)
-{
-  emit8 (v, 0x31);
-  emit8 (v, 0xc9);          /* cx = 0 */
-  emit8 (v, 0x31);
-  emit8 (v, 0xd2);          /* dx = 0 */
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
-}
-
-static void
 emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt)
 {
   emit8 (v, 0xa2);
@@ -667,62 +983,34 @@ emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt
 }
 
 static void
-emit_bios_get_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt)
+emit_bios_video_passthrough_stub (struct byte_vec *v, uint8_t fn)
 {
-  size_t done_from_low;
-  size_t wide_from_2_or_3;
-  size_t done_from_4_or_5;
-  size_t wide_from_6_or_7;
-  size_t done_from_other;
-  size_t wide_pos;
-  size_t done_pos;
-
-  emit8 (v, 0xa0);
-  emit16 (v, rt->video_mode_off);  /* al = current converted mode */
   emit8 (v, 0xb4);
-  emit8 (v, 0x28);                 /* 40 columns by default */
-  emit8 (v, 0x3c);
-  emit8 (v, 0x02);                 /* cmp al, 2 */
-  emit8 (v, 0x72);                 /* jb done */
-  done_from_low = v->len;
-  emit8 (v, 0);
-  emit8 (v, 0x3c);
-  emit8 (v, 0x03);                 /* cmp al, 3 */
-  emit8 (v, 0x76);                 /* jbe wide */
-  wide_from_2_or_3 = v->len;
-  emit8 (v, 0);
-  emit8 (v, 0x3c);
-  emit8 (v, 0x06);                 /* cmp al, 6 */
-  emit8 (v, 0x72);                 /* jb done */
-  done_from_4_or_5 = v->len;
-  emit8 (v, 0);
-  emit8 (v, 0x3c);
-  emit8 (v, 0x07);                 /* cmp al, 7 */
-  emit8 (v, 0x76);                 /* jbe wide */
-  wide_from_6_or_7 = v->len;
-  emit8 (v, 0);
-  emit8 (v, 0xeb);
-  done_from_other = v->len;
-  emit8 (v, 0);
+  emit8 (v, fn);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x10);
+  emit8 (v, 0xc3);
+}
 
-  wide_pos = v->len;
+static void
+emit_bios_passthrough_stub (struct byte_vec *v, uint8_t intr, uint8_t fn)
+{
   emit8 (v, 0xb4);
-  emit8 (v, 0x50);                 /* 80 columns */
+  emit8 (v, fn);
+  emit8 (v, 0xcd);
+  emit8 (v, intr);
+  emit8 (v, 0xc3);
+}
 
-  done_pos = v->len;
+static void
+emit_bios_get_display_combination_stub (struct byte_vec *v)
+{
   emit8 (v, 0x31);
-  emit8 (v, 0xdb);                 /* active page 0 */
+  emit8 (v, 0xc0);          /* AL != 1Ah: no VGA/MCGA display-combo BIOS. */
+  emit8 (v, 0x31);
+  emit8 (v, 0xdb);
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
-
-  v->data[done_from_low] = (uint8_t) (done_pos - (done_from_low + 1u));
-  v->data[wide_from_2_or_3] =
-    (uint8_t) (wide_pos - (wide_from_2_or_3 + 1u));
-  v->data[done_from_4_or_5] =
-    (uint8_t) (done_pos - (done_from_4_or_5 + 1u));
-  v->data[wide_from_6_or_7] =
-    (uint8_t) (wide_pos - (wide_from_6_or_7 + 1u));
-  v->data[done_from_other] = (uint8_t) (done_pos - (done_from_other + 1u));
 }
 
 static void
@@ -737,147 +1025,15 @@ emit_bios_set_palette_stub (struct byte_vec *v)
 }
 
 static void
-emit_bios_read_char_attr_stub (struct byte_vec *v)
+emit_bios_write_pixel_stub (struct byte_vec *v)
 {
-  emit8 (v, 0xb8);
-  emit16 (v, 0x0720);       /* blank character, normal attribute */
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
+  emit_bios_video_passthrough_stub (v, 0x0c);
 }
 
 static void
-emit_bios_key_status_stub (struct byte_vec *v)
+emit_bios_read_pixel_stub (struct byte_vec *v)
 {
-  emit8 (v, 0x31);
-  emit8 (v, 0xc0);          /* no key available */
-  emit8 (v, 0x39);
-  emit8 (v, 0xc0);          /* ZF set */
-  emit8 (v, 0xc3);
-}
-
-static int
-emit_bios_mode13_address (struct byte_vec *v)
-{
-  int i;
-
-  emit8 (v, 0x89);
-  emit8 (v, 0xd0);          /* ax = dx (row) */
-  emit8 (v, 0x89);
-  emit8 (v, 0xc7);          /* di = ax */
-  for (i = 0; i < 6; i++)
-    {
-      emit8 (v, 0xd1);
-      emit8 (v, 0xe7);      /* di <<= 1, total row * 64 */
-    }
-  emit8 (v, 0x89);
-  emit8 (v, 0xc6);          /* si = ax */
-  for (i = 0; i < 8; i++)
-    {
-      emit8 (v, 0xd1);
-      emit8 (v, 0xe6);      /* si <<= 1, total row * 256 */
-    }
-  emit8 (v, 0x01);
-  emit8 (v, 0xf7);          /* di += si, row * 320 */
-  emit8 (v, 0x01);
-  emit8 (v, 0xcf);          /* di += cx (column) */
-  emit8 (v, 0xb8);
-  emit16 (v, 0xa000);       /* mode 13h packed VGA framebuffer */
-  emit8 (v, 0x8e);
-  emit8 (v, 0xc0);          /* es = ax */
-
-  return 1;
-}
-
-static void
-emit_bios_write_pixel_stub (struct byte_vec *v, const struct runtime_info *rt)
-{
-  size_t jne_pos;
-  size_t bios_pos;
-
-  emit8 (v, 0x80);
-  emit8 (v, 0x3e);
-  emit16 (v, rt->video_mode_off);
-  emit8 (v, 0x13);          /* cmp byte [video_mode], 13h */
-  emit8 (v, 0x75);
-  jne_pos = v->len;
-  emit8 (v, 0);
-
-  emit8 (v, 0x53);          /* push bx */
-  emit8 (v, 0x51);          /* push cx */
-  emit8 (v, 0x52);          /* push dx */
-  emit8 (v, 0x56);          /* push si */
-  emit8 (v, 0x57);          /* push di */
-  emit8 (v, 0x06);          /* push es */
-  emit8 (v, 0x88);
-  emit8 (v, 0xc3);          /* bl = al (color) */
-  emit_bios_mode13_address (v);
-  emit8 (v, 0x88);
-  emit8 (v, 0xd8);          /* al = bl */
-  emit8 (v, 0x26);
-  emit8 (v, 0x88);
-  emit8 (v, 0x05);          /* es:[di] = al */
-  emit8 (v, 0x07);          /* pop es */
-  emit8 (v, 0x5f);          /* pop di */
-  emit8 (v, 0x5e);          /* pop si */
-  emit8 (v, 0x5a);          /* pop dx */
-  emit8 (v, 0x59);          /* pop cx */
-  emit8 (v, 0x5b);          /* pop bx */
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
-
-  bios_pos = v->len;
-  emit8 (v, 0xb4);
-  emit8 (v, 0x0c);          /* mov ah, 0Ch */
-  emit8 (v, 0xcd);
-  emit8 (v, 0x10);          /* preserve BIOS behavior outside mode 13h */
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
-
-  v->data[jne_pos] = (uint8_t) (bios_pos - (jne_pos + 1u));
-}
-
-static void
-emit_bios_read_pixel_stub (struct byte_vec *v, const struct runtime_info *rt)
-{
-  size_t jne_pos;
-  size_t bios_pos;
-
-  emit8 (v, 0x80);
-  emit8 (v, 0x3e);
-  emit16 (v, rt->video_mode_off);
-  emit8 (v, 0x13);          /* cmp byte [video_mode], 13h */
-  emit8 (v, 0x75);
-  jne_pos = v->len;
-  emit8 (v, 0);
-
-  emit8 (v, 0x53);          /* push bx */
-  emit8 (v, 0x51);          /* push cx */
-  emit8 (v, 0x52);          /* push dx */
-  emit8 (v, 0x56);          /* push si */
-  emit8 (v, 0x57);          /* push di */
-  emit8 (v, 0x06);          /* push es */
-  emit_bios_mode13_address (v);
-  emit8 (v, 0x26);
-  emit8 (v, 0x8a);
-  emit8 (v, 0x05);          /* al = es:[di] */
-  emit8 (v, 0x07);          /* pop es */
-  emit8 (v, 0x5f);          /* pop di */
-  emit8 (v, 0x5e);          /* pop si */
-  emit8 (v, 0x5a);          /* pop dx */
-  emit8 (v, 0x59);          /* pop cx */
-  emit8 (v, 0x5b);          /* pop bx */
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
-
-  bios_pos = v->len;
-  emit8 (v, 0xb4);
-  emit8 (v, 0x0d);          /* mov ah, 0Dh */
-  emit8 (v, 0xcd);
-  emit8 (v, 0x10);          /* preserve BIOS behavior outside mode 13h */
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
-
-  v->data[jne_pos] = (uint8_t) (bios_pos - (jne_pos + 1u));
+  emit_bios_video_passthrough_stub (v, 0x0d);
 }
 
 static int
@@ -894,44 +1050,47 @@ emit_bios_video_stub_for_fn (struct byte_vec *v, uint8_t fn,
     case 0x05:              /* select active display page */
     case 0x06:              /* scroll up */
     case 0x07:              /* scroll down */
-      emit_clear_carry_stub (v);
+      (void) rt;
+      emit_bios_video_passthrough_stub (v, fn);
       return 1;
     case 0x0b:              /* set palette/background */
       emit_bios_set_palette_stub (v);
       return 1;
     case 0x03:              /* get cursor position and size */
-      emit_bios_get_cursor_stub (v);
+      (void) rt;
+      emit_bios_video_passthrough_stub (v, 0x03);
       return 1;
     case 0x08:              /* read character/attribute at cursor */
-      emit_bios_read_char_attr_stub (v);
+      (void) rt;
+      emit_bios_video_passthrough_stub (v, 0x08);
       return 1;
     case 0x09:              /* write character/attribute at cursor */
     case 0x0a:              /* write character at cursor */
-      emit_bios_write_al_stub (v, 1);
+      (void) rt;
+      emit_bios_video_passthrough_stub (v, fn);
       return 1;
     case 0x0c:              /* write graphics pixel */
-      emit_bios_write_pixel_stub (v, rt);
+      (void) rt;
+      emit_bios_write_pixel_stub (v);
       return 1;
     case 0x0d:              /* read graphics pixel */
-      emit_bios_read_pixel_stub (v, rt);
+      (void) rt;
+      emit_bios_read_pixel_stub (v);
       return 1;
     case 0x0e:              /* teletype output */
-      emit_bios_write_al_stub (v, 0);
+      (void) rt;
+      emit_bios_video_passthrough_stub (v, 0x0e);
       return 1;
     case 0x0f:              /* get current video mode */
-      emit_bios_get_video_mode_stub (v, rt);
+      (void) rt;
+      emit_bios_video_passthrough_stub (v, 0x0f);
       return 1;
-    case 0x12:              /* EGA/VGA alternate select */
-    case 0x30:              /* PCjr/MCGA/VGA miscellaneous services */
-      emit_clear_carry_stub (v);
+    case 0x12:              /* EGA alternate select/query */
+      (void) rt;
+      emit_bios_video_passthrough_stub (v, 0x12);
       return 1;
     case 0x1a:              /* get display combination code */
-      emit8 (v, 0xb8);
-      emit16 (v, 0x001a);   /* AL = 1Ah means function supported */
-      emit8 (v, 0xbb);
-      emit16 (v, 0x0008);   /* color display */
-      emit8 (v, 0xf8);
-      emit8 (v, 0xc3);
+      emit_bios_get_display_combination_stub (v);
       return 1;
     default:
       return 0;
@@ -945,11 +1104,15 @@ emit_bios_keyboard_stub_for_fn (struct byte_vec *v, uint8_t fn)
     {
     case 0x00:              /* read key */
     case 0x10:              /* enhanced read key */
-      emit_read_char_stub (v, 0);
+      emit_read_char_stub (v, 0, 1);
       return 1;
     case 0x01:              /* check key */
     case 0x11:              /* enhanced check key */
-      emit_bios_key_status_stub (v);
+      emit8 (v, 0x31);
+      emit8 (v, 0xc0);      /* ax = 0 */
+      emit8 (v, 0x39);
+      emit8 (v, 0xc0);      /* ZF set: no key pending */
+      emit8 (v, 0xc3);
       return 1;
     case 0x02:              /* get shift flags */
     case 0x12:
@@ -966,35 +1129,16 @@ emit_bios_clock_stub_for_fn (struct byte_vec *v, uint8_t fn)
   switch (fn)
     {
     case 0x00:              /* get timer ticks */
-      emit8 (v, 0x31);
-      emit8 (v, 0xc0);      /* no midnight rollover */
-      emit8 (v, 0x31);
-      emit8 (v, 0xc9);
-      emit8 (v, 0x31);
-      emit8 (v, 0xd2);      /* tick count 0 */
-      emit8 (v, 0xf8);
-      emit8 (v, 0xc3);
+      emit_bios_passthrough_stub (v, 0x1a, 0x00);
       return 1;
     case 0x01:              /* set timer ticks */
-      emit_clear_carry_stub (v);
+      emit_bios_passthrough_stub (v, 0x1a, 0x01);
       return 1;
     case 0x02:              /* get RTC time, BCD */
-      emit8 (v, 0x31);
-      emit8 (v, 0xc0);
-      emit8 (v, 0xb9);
-      emit16 (v, 0x1200);   /* 12:00 */
-      emit8 (v, 0x31);
-      emit8 (v, 0xd2);
-      emit8 (v, 0xf8);
-      emit8 (v, 0xc3);
+      emit_bios_passthrough_stub (v, 0x1a, 0x02);
       return 1;
     case 0x04:              /* get RTC date, BCD */
-      emit8 (v, 0xb9);
-      emit16 (v, 0x1991);
-      emit8 (v, 0xba);
-      emit16 (v, 0x0101);
-      emit8 (v, 0xf8);
-      emit8 (v, 0xc3);
+      emit_bios_passthrough_stub (v, 0x1a, 0x04);
       return 1;
     default:
       return 0;
@@ -1120,7 +1264,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       emit_exit_stub (v, 0);
       return 1;
     case 0x01:
-      emit_read_char_stub (v, 1);
+      emit_read_char_stub (v, 1, 0);
       return 1;
     case 0x02:
       emit_write_char_stub (v);
@@ -1130,7 +1274,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       return 1;
     case 0x07:
     case 0x08:
-      emit_read_char_stub (v, 0);
+      emit_read_char_stub (v, 0, 0);
       return 1;
     case 0x09:
       emit_string_stub (v);
@@ -1166,7 +1310,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       return 1;
     case 0x1b:
     case 0x1c:
-      emit_get_disk_free_stub (v);
+      emit_get_allocation_info_stub (v, rt);
       return 1;
     case 0x1a:
       emit_set_dta_stub (v, rt);
@@ -1202,7 +1346,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       emit_get_dta_stub (v, rt);
       return 1;
     case 0x25:
-      emit_success_stub (v);
+      emit_set_vector_stub (v);
       return 1;
     case 0x30:
       emit_get_version_stub (v);
@@ -1235,7 +1379,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       emit_close_stub (v);
       return 1;
     case 0x3f:
-      emit_readwrite_stub (v, 3);
+      emit_read_stub (v, rt);
       return 1;
     case 0x40:
       emit_readwrite_stub (v, 4);
@@ -1270,9 +1414,11 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
     case 0x48:
       emit_alloc_stub (v, rt);
       return 1;
-    case 0x49:
     case 0x4a:
       emit_success_stub (v);
+      return 1;
+    case 0x49:
+      emit_free_stub (v, rt);
       return 1;
     case 0x54:
       emit_success_stub (v);
@@ -1437,5 +1583,3 @@ append_int21_interrupt_handler (struct byte_vec *text,
   (void) clear;
   return (uint16_t) start;
 }
-
-static void

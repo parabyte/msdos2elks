@@ -345,17 +345,23 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
   uint16_t next_para;
   uint16_t limit_para;
 
-  if (data->len + 8u > ELKS_MAX16)
+  if (data->len + 523u > ELKS_MAX16)
     die ("data segment is too large for converter runtime state");
 
   rt->heap_next_off = (uint16_t) data->len;
   rt->heap_limit_off = (uint16_t) (data->len + 2u);
   rt->dta_off_off = (uint16_t) (data->len + 4u);
   rt->video_mode_off = (uint16_t) (data->len + 6u);
+  rt->heap_base_seg_off = (uint16_t) (data->len + 8u);
+  rt->io_buf_off = (uint16_t) (data->len + 10u);
+  rt->media_id_off = (uint16_t) (data->len + 522u);
   emit16 (data, 0);
   emit16 (data, 0);
   emit16 (data, 0x80);
   emit16 (data, 0x0003);
+  emit16 (data, 0);
+  vec_append_zeros (data, 512u);
+  emit8 (data, 0xf8);
 
   runtime_end = (uint32_t) data->len;
   next_para = align_para (runtime_end + bss);

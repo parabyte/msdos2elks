@@ -723,6 +723,116 @@ ne_add_segment (struct image *img, uint32_t mz_base, const uint8_t *src,
   return img->ne_nsegs - 1u;
 }
 
+static int
+mz_dos_alloc_request_is_free_probe (const uint8_t *image, size_t image_len,
+                                    size_t fn_pos)
+{
+  size_t pos;
+  size_t end;
+  int saw_call = 0;
+
+  end = fn_pos + 40u < image_len ? fn_pos + 40u : image_len;
+  for (pos = fn_pos + 2u; pos + 1u < end; pos++)
+    if (image[pos] == 0xcd && image[pos + 1u] == 0x21)
+      {
+        pos += 2u;
+        saw_call = 1;
+        break;
+      }
+  if (!saw_call)
+    return 0;
+
+  for (; pos + 3u < end; pos++)
+    {
+      if (image[pos] == 0xb4 && image[pos + 1u] == 0x48)
+        return 0;
+      if (image[pos] == 0xb4 && image[pos + 1u] == 0x49
+          && image[pos + 2u] == 0xcd && image[pos + 3u] == 0x21)
+        return 1;
+    }
+
+  return 0;
+}
+
+static uint16_t
+mz_image_max_dos_alloc_request (const uint8_t *image, size_t image_len)
+{
+  uint16_t max = 0;
+  size_t i;
+
+  for (i = 0; i + 3u < image_len; i++)
+    {
+      if (image[i] == 0xb4 && image[i + 1u] == 0x48
+          && image[i + 2u] == 0xcd && image[i + 3u] == 0x21)
+        max = max ? max : 1;
+      if (i + 4u < image_len && image[i] == 0xb8
+          && image[i + 2u] == 0x48 && image[i + 3u] == 0xcd
+          && image[i + 4u] == 0x21)
+        max = max ? max : 1;
+      if (image[i] == 0xb4 && image[i + 1u] == 0x48)
+        {
+          size_t j;
+
+          for (j = i + 2u; j + 4u < image_len && j < i + 12u; j++)
+            if (image[j] == 0xbb)
+              {
+                uint16_t request = get16 (image + j + 1u);
+
+                if (request != 0xffffu
+                    && !mz_dos_alloc_request_is_free_probe (image, image_len,
+                                                            i)
+                    && request > max)
+                  max = request;
+                break;
+              }
+        }
+    }
+  return max;
+}
+
+static void
+ne_enable_conventional_dos_heap (struct image *img, unsigned runtime_seg,
+                                 struct runtime_info *rt, uint16_t max_request)
+{
+  struct ne_seg_image *seg = &img->ne_seg[runtime_seg];
+  uint16_t largest;
+
+  largest = max_request;
+
+  /*
+   * Some DOS games allocate a conventional-memory arena far larger than one
+   * 64 KiB NE segment and then address it with real-mode segment arithmetic.
+   * Prefer a kernel-owned fmemalloc arena so ELKS will release it with the
+   * process.  Reads into subsegments still use the runtime bounce buffer
+   * because ELKS validates syscall buffers against exact segment bases.
+   */
+  put16 (seg->bytes.data + rt->heap_next_off, 0);
+  put16 (seg->bytes.data + rt->heap_limit_off, largest);
+  put16 (seg->bytes.data + rt->heap_base_seg_off, 0xffffu);
+}
+
+static void
+ne_enable_far_dos_heap (struct image *img, unsigned runtime_seg,
+                        struct runtime_info *rt)
+{
+  static const uint8_t zero = 0;
+  unsigned heap_seg;
+  struct ne_seg_image *seg;
+
+  if (img->ne_nsegs >= NE_MAX_SEGS)
+    return;
+
+  heap_seg = ne_add_segment (img, 0x100000u, &zero, 1u, NESEG_DATA);
+  img->ne_seg[heap_seg].min_alloc = 0xfff0u;
+
+  seg = &img->ne_seg[runtime_seg];
+  put16 (seg->bytes.data + rt->heap_next_off, 0);
+  put16 (seg->bytes.data + rt->heap_limit_off, 0x0fffu);
+  ne_reloc_add (&seg->rels, rt->heap_base_seg_off, NEFIXSRC_SEGMENT,
+                NEFIXFLG_INTERNAL, (uint8_t) (heap_seg + 1u), 0);
+  seg->flags |= NESEG_RELOCINFO;
+}
+
 static void
 append_ne_mz_startup (struct image *img, unsigned startup_seg,
                       unsigned target_seg, uint16_t target_off,
@@ -844,6 +954,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
   unsigned data_seg;
   int entry_seg;
   int runtime_in_code;
+  uint16_t dos_alloc_max;
   uint32_t pos;
   uint16_t psp_top_para = 0;
   uint16_t i;
@@ -851,6 +962,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
   (void) input_len;
   img->os2_ne = 1;
   init_image_memory (img, opts);
+  dos_alloc_max = mz_image_max_dos_alloc_request (image, image_len);
   if (!opts->heap_set)
     img->heap = mz_heap_from_minalloc (h->minalloc);
   if (!opts->stack_set)
@@ -907,10 +1019,20 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
       psp_top_para = align_para ((uint32_t) seg->bytes.len);
       append_runtime_state_to_data (&seg->bytes, img->heap, img->stack,
                                     img->bss, &rt);
+      if (dos_alloc_max > 0x0fffu)
+        ne_enable_conventional_dos_heap (img, 0, &rt, dos_alloc_max);
+      else if (dos_alloc_max)
+        ne_enable_far_dos_heap (img, 0, &rt);
     }
   else
-    append_runtime_state_to_data (&img->ne_seg[data_seg].bytes, img->heap,
-                                  img->stack, img->bss, &rt);
+    {
+      append_runtime_state_to_data (&img->ne_seg[data_seg].bytes, img->heap,
+                                    img->stack, img->bss, &rt);
+      if (dos_alloc_max > 0x0fffu)
+        ne_enable_conventional_dos_heap (img, data_seg, &rt, dos_alloc_max);
+      else if (dos_alloc_max)
+        ne_enable_far_dos_heap (img, data_seg, &rt);
+    }
 
   data_len = img->ne_seg[data_seg].bytes.len;
   if (data_len + img->bss > ELKS_MAX16)
