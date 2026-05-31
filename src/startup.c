@@ -223,9 +223,10 @@ append_com_argv_startup (struct image *img, int install_int21,
   if (install_int16)
     emit_install_int16_vector (&img->text, int16_handler);
   vec_append (&img->text, prefix, sizeof (prefix));
+  if (direct_video)
+    emit_save_initial_video_mode (&img->text, rt);
   if (raw_keyboard)
     emit_stdin_raw_mode (&img->text, rt);
-  (void) direct_video;
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding COM argv startup");
 
@@ -325,9 +326,10 @@ append_mz_argv_startup (struct image *img, uint16_t original_entry,
   if (install_int16)
     emit_install_int16_vector (&img->text, int16_handler);
   vec_append (&img->text, prefix, sizeof (prefix));
+  if (direct_video)
+    emit_save_initial_video_mode (&img->text, rt);
   if (raw_keyboard)
     emit_stdin_raw_mode (&img->text, rt);
-  (void) direct_video;
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding MZ argv startup");
 
@@ -368,6 +370,7 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
   rt->heap_limit_off = (uint16_t) (data->len + 2u);
   rt->dta_off_off = (uint16_t) (data->len + 4u);
   rt->video_mode_off = (uint16_t) (data->len + 6u);
+  rt->video_restore_mode_off = (uint16_t) (data->len + 7u);
   rt->heap_base_seg_off = (uint16_t) (data->len + 8u);
   rt->keyboard_fd_off = (uint16_t) (data->len + 10u);
   rt->keyboard_mode_off = (uint16_t) (data->len + 12u);
@@ -377,7 +380,7 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
   emit16 (data, 0);
   emit16 (data, 0);
   emit16 (data, 0x80);
-  emit16 (data, 0x0003);
+  emit16 (data, 0x0303);
   emit16 (data, 0);
   emit16 (data, 0xffffu);
   emit16 (data, 0);

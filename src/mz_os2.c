@@ -893,9 +893,10 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
       emit8 (&seg->bytes, 0x58);
     }
   vec_append (&seg->bytes, prefix, sizeof (prefix));
+  if (direct_video)
+    emit_save_initial_video_mode (&seg->bytes, rt);
   if (raw_keyboard)
     emit_stdin_raw_mode (&seg->bytes, rt);
-  (void) direct_video;
   if (seg->bytes.len + 5u > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
 

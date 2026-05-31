@@ -178,7 +178,7 @@ if ! od -v -An -tx1 "$video_output" | tr -d ' \n' | grep -q 'b400cd10'; then
 fi
 
 video_hex=$(od -v -An -tx1 "$video_output" | tr -d ' \n')
-for sig in 3c0472 b90144 b90344 b90244 b90444; do
+for sig in b40fcd10 3c0472 b90144 b90344 30e4cd10 b90444 b90244; do
   if ! printf '%s' "$video_hex" | grep -q "$sig"; then
     printf 'selftest: BIOS graphics console-lock signature %s missing\n' \
            "$sig" >&2
@@ -186,6 +186,16 @@ for sig in 3c0472 b90144 b90344 b90244 b90444; do
     exit 1
   fi
 done
+if ! printf '%s' "$video_hex" | grep -q 'b90144.*b90344.*b400cd10'; then
+  printf 'selftest: BIOS graphics mode set did not claim console before INT 10h\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+if ! printf '%s' "$video_hex" | grep -q 'b90444.*30e4cd10.*b90244'; then
+  printf 'selftest: BIOS graphics exit did not release raw keyboard, restore text, then release graphics\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
 
 if ! od -v -An -tx1 "$video_output" | tr -d ' \n' | grep -q 'b40bcd10'; then
   printf 'selftest: BIOS palette stub did not restore AH=0Bh\n' >&2

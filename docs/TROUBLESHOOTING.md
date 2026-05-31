@@ -46,9 +46,10 @@ display output.
 If the program relies on direct CGA/EGA/VGA memory access, the target ELKS
 configuration and hardware must expose that video memory in a way the process
 can use.  Converted programs that set a BIOS graphics mode through a rewritten
-`int 10h` call ask ELKS to stop console painting while the program owns the
-display; programs that switch hardware without a recognizable BIOS mode-set
-call may still need target-side validation.
+`int 10h` call ask ELKS to stop console painting before the BIOS mode switch,
+then restore a text mode and release the console lock on exit.  Programs that
+switch hardware without a recognizable BIOS mode-set call may still need
+target-side validation.
 
 Legacy graphics libraries can misdetect a VGA BIOS and then select a memory
 layout that does not match the code bundled with the program.  The converter

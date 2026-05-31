@@ -1,5 +1,8 @@
 #include "internal.h"
 
+static void patch_rel8 (struct byte_vec *v, size_t pos, size_t target);
+static void patch_rel16 (struct byte_vec *v, size_t pos, size_t target);
+
 static void
 emit_dos_tail (struct byte_vec *v)
 {
@@ -579,6 +582,101 @@ emit_free_stub (struct byte_vec *v, const struct runtime_info *rt)
 }
 
 static void
+emit_restore_text_mode_if_needed (struct byte_vec *v,
+                                  const struct runtime_info *rt)
+{
+  size_t already_text_rel;
+  size_t already_mda_rel;
+  size_t saved_text_rel;
+  size_t saved_mda_rel;
+  size_t restore;
+  size_t done;
+
+  /*
+   * The low byte at video_mode_off tracks the DOS program's current BIOS
+   * mode request.  The next byte, video_restore_mode_off, is captured at
+   * startup using INT 10h AH=0Fh.  On exit, restore only after the program
+   * has selected a graphics or adapter-specific mode.  Text modes 00h-03h
+   * and MDA mode 07h are already safe for the ELKS console.
+   */
+  emit8 (v, 0xa0);
+  emit16 (v, rt->video_mode_off);          /* al = current DOS video mode */
+  emit8 (v, 0x24);
+  emit8 (v, 0x7f);                         /* ignore no-clear bit */
+  emit8 (v, 0x3c);
+  emit8 (v, 0x04);                         /* modes 00h-03h are text */
+  emit8 (v, 0x72);
+  already_text_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 0x07);                         /* MDA text mode */
+  emit8 (v, 0x74);
+  already_mda_rel = v->len;
+  emit8 (v, 0);
+
+  emit8 (v, 0xa0);
+  emit16 (v, rt->video_restore_mode_off);  /* al = startup text mode */
+  emit8 (v, 0x24);
+  emit8 (v, 0x7f);
+  emit8 (v, 0x3c);
+  emit8 (v, 0x04);
+  emit8 (v, 0x72);
+  saved_text_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 0x07);
+  emit8 (v, 0x74);
+  saved_mda_rel = v->len;
+  emit8 (v, 0);
+
+  /*
+   * If the startup mode was not a text mode, fall back to 80x25 color text
+   * mode 03h.  That is the most portable BIOS text restore for CGA/EGA/VGA
+   * targets; MDA targets normally report mode 07h above and avoid this path.
+   */
+  emit8 (v, 0xb0);
+  emit8 (v, 0x03);                         /* al = fallback text mode */
+
+  restore = v->len;
+  patch_rel8 (v, saved_text_rel, restore);
+  patch_rel8 (v, saved_mda_rel, restore);
+  emit8 (v, 0xa2);
+  emit16 (v, rt->video_mode_off);          /* runtime now expects text */
+  emit8 (v, 0x30);
+  emit8 (v, 0xe4);                         /* ah = BIOS set-mode function */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x10);
+
+  done = v->len;
+  patch_rel8 (v, already_text_rel, done);
+  patch_rel8 (v, already_mda_rel, done);
+}
+
+static void
+emit_save_initial_video_mode (struct byte_vec *v,
+                              const struct runtime_info *rt)
+{
+  /*
+   * Save the boot/ELKS text mode before the DOS program starts changing
+   * video state.  INT 10h AH=0Fh returns AL=current mode, AH=columns, and
+   * BH=active page.  Preserve the caller registers because this helper runs
+   * inside the generated process startup code.
+   */
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0xb4);
+  emit8 (v, 0x0f);          /* BIOS get current video mode */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x10);
+  emit8 (v, 0xa2);
+  emit16 (v, rt->video_restore_mode_off);
+  emit8 (v, 0xa2);
+  emit16 (v, rt->video_mode_off);
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0x58);          /* pop ax */
+}
+
+static void
 emit_release_console_video (struct byte_vec *v, const struct runtime_info *rt)
 {
   enum
@@ -587,7 +685,9 @@ emit_release_console_video (struct byte_vec *v, const struct runtime_info *rt)
     ELKS_DCREL_GRAPH = 0x4402,
     ELKS_DCREL_KRAW = 0x4404
   };
-  size_t done_rel;
+  size_t no_fd_rel;
+  size_t done_jmp;
+  size_t done;
 
   emit8 (v, 0x50);          /* push ax */
   emit8 (v, 0x53);          /* push bx */
@@ -599,7 +699,7 @@ emit_release_console_video (struct byte_vec *v, const struct runtime_info *rt)
   emit16 (v, rt->keyboard_fd_off);
   emit16 (v, 0xffffu);      /* no console fd was opened by startup */
   emit8 (v, 0x74);
-  done_rel = v->len;
+  no_fd_rel = v->len;
   emit8 (v, 0);
 
   emit8 (v, 0x8b);
@@ -613,6 +713,8 @@ emit_release_console_video (struct byte_vec *v, const struct runtime_info *rt)
   emit16 (v, ELKS_SYS_IOCTL);
   emit8 (v, 0xcd);
   emit8 (v, 0x80);
+
+  emit_restore_text_mode_if_needed (v, rt);
 
   emit8 (v, 0x8b);
   emit8 (v, 0x1e);
@@ -631,7 +733,15 @@ emit_release_console_video (struct byte_vec *v, const struct runtime_info *rt)
   emit16 (v, rt->keyboard_mode_off);
   emit16 (v, 0);
 
-  v->data[done_rel] = (uint8_t) (v->len - (done_rel + 1u));
+  emit8 (v, 0xe9);
+  done_jmp = v->len;
+  emit16 (v, 0);
+
+  patch_rel8 (v, no_fd_rel, v->len);
+  emit_restore_text_mode_if_needed (v, rt);
+
+  done = v->len;
+  patch_rel16 (v, done_jmp, done);
   emit8 (v, 0x5a);          /* pop dx */
   emit8 (v, 0x59);          /* pop cx */
   emit8 (v, 0x5b);          /* pop bx */
@@ -1808,11 +1918,11 @@ emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt
 {
   emit8 (v, 0xa2);
   emit16 (v, rt->video_mode_off);  /* mov [video_mode], al */
+  emit_enable_console_raw_scancodes (v, rt);
   emit8 (v, 0xb4);
   emit8 (v, 0x00);                 /* mov ah, 00h */
   emit8 (v, 0xcd);
   emit8 (v, 0x10);                 /* let BIOS switch real hardware */
-  emit_enable_console_raw_scancodes (v, rt);
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }

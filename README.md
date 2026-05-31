@@ -159,11 +159,13 @@ dispatch through the same ELKS adapters.
 
 BIOS video conversion passes static `int 10h` video services through to the
 machine BIOS whenever the function number is known.  Mode-set calls record the
-requested BIOS mode; graphics and adapter-specific modes also claim the ELKS
-console graphics lock and raw keyboard path so ELKS console output does not
-paint over DOS programs that draw directly through video hardware.  The ROM
-BIOS and target machine still decide which CGA, MDA, EGA, VGA, MCGA, or
-adapter-specific modes are actually available.
+requested BIOS mode; graphics and adapter-specific modes first claim the ELKS
+console graphics lock and raw keyboard path, then call the ROM BIOS so ELKS
+console output does not paint over DOS programs that draw directly through
+video hardware.  On exit, the generated runtime releases raw keyboard mode,
+restores the startup text mode when practical, and then releases the graphics
+lock.  The ROM BIOS and target machine still decide which CGA, MDA, EGA, VGA,
+MCGA, or adapter-specific modes are actually available.
 
 Supported DOS functions:
 

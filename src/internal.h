@@ -181,6 +181,7 @@ struct runtime_info
   uint16_t heap_limit_off;
   uint16_t dta_off_off;
   uint16_t video_mode_off;
+  uint16_t video_restore_mode_off;
   uint16_t heap_base_seg_off;
   uint16_t keyboard_fd_off;
   uint16_t keyboard_mode_off;

@@ -107,9 +107,12 @@ mode setup and direct video access   passed through or handled by small stubs
 Direct video memory access is often left intact because many DOS programs write
 to CGA/EGA/VGA memory themselves.  When a converted program switches to a BIOS
 graphics or adapter-specific mode through a rewritten `int 10h` mode-set call,
-the runtime asks ELKS for the console graphics lock and raw keyboard mode.  That
-prevents ELKS console output from painting over the DOS program while still
-leaving the real BIOS and hardware in control of the selected video mode.
+the runtime asks ELKS for the console graphics lock and raw keyboard mode before
+calling the ROM BIOS.  That prevents ELKS console output from painting over the
+DOS program while still leaving the real BIOS and hardware in control of the
+selected video mode.  The startup code records the current text mode, and the
+exit path releases raw keyboard mode, restores that text mode when practical,
+and then releases the graphics lock.
 
 Enhanced adapter discovery is intentionally conservative.  Static `int 10h`
 queries such as EGA alternate-select, display-combination, and enhanced video
