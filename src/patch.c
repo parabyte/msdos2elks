@@ -699,6 +699,22 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
           al_known = 1;
           fn = text->data[i - 1u];
         }
+      else if (intr == 0x21 && i >= 2u
+               && text->data[i - 2u] == 0x8a
+               && text->data[i - 1u] == 0xe0)
+        {
+          /*
+           * C runtime directory helpers commonly put a selected DOS
+           * function in AL, copy it to AH with "mov ah, al", then issue
+           * INT 21h.  Treat that as intentionally dynamic so the generated
+           * INT 21h vector handles AH at run time; scanning farther back for
+           * an unrelated "mov ah, imm" can otherwise make a compact patch
+           * overlap several DOS calls in the same helper.
+           */
+          stats->dynamic_int21 = 1;
+          i += insn_len;
+          continue;
+        }
       else if (find_compact_call_candidate (text, original_len, i,
                                             text_relocs, &start, &body_start,
                                             &fn, &al_known, &al))

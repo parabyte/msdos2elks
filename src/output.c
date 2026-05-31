@@ -106,7 +106,12 @@ write_os2_ne (const char *path, const struct image *img)
   emit8 (&out, 0x02);          /* multiple-data program */
   emit8 (&out, 0);
   emit16 (&out, (uint16_t) (img->ne_auto_data + 1u));
-  emit16 (&out, img->heap);
+  /*
+   * ELKS' OS/2 NE loader treats ffffh as "maximum heap".  The converter uses
+   * ELKS_MAX_HEAP internally as the 64 KiB-minus-paragraph sentinel because
+   * that value is also safe for flat a.out accounting.
+   */
+  emit16 (&out, img->heap >= ELKS_MAX_HEAP ? 0xffffu : img->heap);
   emit16 (&out, img->stack);
   emit16 (&out, img->entry);
   emit16 (&out, (uint16_t) (img->ne_entry_seg + 1u));
@@ -248,4 +253,3 @@ free_image (struct image *img)
       free (img->ne_seg[i].rels.data);
     }
 }
-

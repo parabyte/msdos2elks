@@ -173,6 +173,104 @@ guess_mz_data_para (const uint8_t *image, size_t image_len,
   return chosen;
 }
 
+static int mz_instruction_transfers_control (const uint8_t *section,
+                                             size_t pos, size_t len);
+
+static uint16_t
+mz_stack_alias_para (const uint8_t *image, size_t image_len,
+                     const uint8_t *file, const struct mz_header *h,
+                     uint16_t fallback)
+{
+  uint16_t best = fallback;
+  uint16_t i;
+
+  /*
+   * Several DOS C runtimes relocate a paragraph constant into a general
+   * register, then move that register into SS after some setup.  The constant
+   * can be below the MZ header SS; the runtime is deliberately creating a
+   * lower stack/data alias so large positive offsets reach the same physical
+   * area.  NE fixups can relocate a segment base but cannot add a paragraph
+   * delta, so choose that lower paragraph as the generated auto-data base.
+   */
+  for (i = 0; i < h->crlc; i++)
+    {
+      size_t rpos = (size_t) h->lfarlc + (size_t) i * 4u;
+      uint16_t off = get16 (file + rpos);
+      uint16_t seg = get16 (file + rpos + 2u);
+      uint32_t loc32 = ((uint32_t) seg << 4) + off;
+      size_t loc;
+      size_t pos;
+      size_t limit;
+      uint8_t reg;
+      uint16_t val;
+
+      if (loc32 < 1u || loc32 + 1u >= image_len)
+        continue;
+      loc = (size_t) loc32;
+      if (image[loc - 1u] < 0xb8 || image[loc - 1u] > 0xbfu)
+        continue;
+      val = get16 (image + loc);
+      if ((uint32_t) val * 16u >= image_len || val >= best)
+        continue;
+
+      reg = (uint8_t) (image[loc - 1u] - 0xb8u);
+      pos = loc + 2u;
+      limit = pos + 64u < image_len ? pos + 64u : image_len;
+      while (pos + 1u < limit)
+        {
+          size_t len;
+
+          if (image[pos] == 0x8e
+              && image[pos + 1u] == (uint8_t) (0xd0u | reg))
+            {
+              best = val;
+              break;
+            }
+          if (mz_instruction_transfers_control (image, pos,
+                                                limit - pos > 6u
+                                                ? 6u : limit - pos))
+            break;
+          len = scan_instruction_len (image + pos, limit - pos);
+          pos += len ? len : 1u;
+        }
+    }
+
+  return best;
+}
+
+static uint16_t
+mz_code_para_covering_relocs (const uint8_t *image, size_t image_len,
+                              const uint8_t *file,
+                              const struct mz_header *h,
+                              uint16_t code_para)
+{
+  uint32_t code_base = (uint32_t) code_para << 4;
+  uint16_t i;
+
+  (void) image;
+
+  /*
+   * The MZ header CS:IP is the entry point, not necessarily the first byte of
+   * code in the load image.  Some linkers place relocated startup code before
+   * the entry paragraph.  If we start the generated text segment at CS, those
+   * relocation records fall outside every selected NE segment and conversion
+   * fails.  Move the text base down to cover such relocated words; the entry
+   * jump is still computed from the original MZ CS:IP later.
+   */
+  for (i = 0; i < h->crlc; i++)
+    {
+      size_t rpos = (size_t) h->lfarlc + (size_t) i * 4u;
+      uint16_t off = get16 (file + rpos);
+      uint16_t seg = get16 (file + rpos + 2u);
+      uint32_t loc = ((uint32_t) seg << 4) + off;
+
+      if (loc + 1u < image_len && loc < code_base)
+        code_base = loc & ~(uint32_t) 0x0fu;
+    }
+
+  return (uint16_t) (code_base >> 4);
+}
+
 static uint16_t
 mz_heap_from_minalloc (uint16_t minalloc)
 {
@@ -181,6 +279,27 @@ mz_heap_from_minalloc (uint16_t minalloc)
   if (bytes >= ELKS_MAX_HEAP)
     return ELKS_MAX_HEAP;
   return (uint16_t) bytes;
+}
+
+static uint16_t
+mz_heap_from_allocs (uint16_t minalloc, uint16_t maxalloc)
+{
+  /*
+   * DOS MZ headers describe the extra memory requested after the loaded
+   * image.  A maxalloc value of ffffh is the normal DOS spelling for
+   * "give this program as much conventional memory as possible".  Many
+   * games and graphics libraries then build private stacks or arenas near
+   * that top-of-memory value.  Keep that DOS contract for OS/2 NE output so
+   * ELKS allocates a high auto-data ceiling instead of a tiny minalloc-only
+   * stack area.
+   */
+  if (maxalloc == 0xffffu)
+    return ELKS_MAX_HEAP;
+
+  if (maxalloc > minalloc)
+    minalloc = maxalloc;
+
+  return mz_heap_from_minalloc (minalloc);
 }
 
 static int
@@ -723,6 +842,102 @@ ne_add_segment (struct image *img, uint32_t mz_base, const uint8_t *src,
   return img->ne_nsegs - 1u;
 }
 
+static unsigned
+ne_add_psp_segment (struct image *img)
+{
+  uint8_t psp[256];
+
+  /*
+   * DOS runs MZ EXE entry code with DS and ES pointing at a 256-byte
+   * Program Segment Prefix, not at the program's data segment.  The command
+   * tail at PSP:0080h is filled by the generated startup code from ELKS'
+   * argv stack.  Keep this as a real NE data segment so larger EXE runtimes
+   * can save the PSP segment without trampling initialized data at offsets
+   * below 0100h.
+   */
+  memset (psp, 0, sizeof (psp));
+  psp[0] = 0xcd;             /* INT 20h, the traditional PSP signature. */
+  psp[1] = 0x20;
+  return ne_add_segment (img, 0x110000u, psp, sizeof (psp), NESEG_DATA);
+}
+
+static unsigned
+ne_add_env_segment (struct image *img)
+{
+  uint8_t env[64];
+  static const uint8_t argv0[] = "C:\\PROGRAM.EXE";
+
+  /*
+   * DOS stores a segment pointer to the process environment at PSP:002Ch.
+   * A valid empty environment starts with a double NUL.  DOS 3.x and later
+   * then store a word count and the program path; older C runtimes use that
+   * tail while building argv[0], and some report a fatal environment error if
+   * it is missing.
+   */
+  memset (env, 0, sizeof (env));
+  env[2] = 1;
+  memcpy (env + 4u, argv0, sizeof (argv0));
+  return ne_add_segment (img, 0x111000u, env, sizeof (env), NESEG_DATA);
+}
+
+static uint16_t align_para (uint32_t bytes);
+
+static void
+emit_ne_mov_ax_segment (struct ne_seg_image *seg, unsigned target_seg)
+{
+  size_t imm;
+
+  emit8 (&seg->bytes, 0xb8);        /* mov ax, segment */
+  imm = seg->bytes.len;
+  emit16 (&seg->bytes, 0);
+  ne_reloc_add (&seg->rels, (uint16_t) imm, NEFIXSRC_SEGMENT,
+                NEFIXFLG_INTERNAL, (uint8_t) (target_seg + 1u), 0);
+  seg->flags |= NESEG_RELOCINFO;
+}
+
+static void
+emit_ne_set_es_to_segment (struct ne_seg_image *seg, unsigned target_seg)
+{
+  emit_ne_mov_ax_segment (seg, target_seg);
+  emit8 (&seg->bytes, 0x8e);
+  emit8 (&seg->bytes, 0xc0);        /* mov es, ax */
+}
+
+static void
+emit_ne_set_ds_es_to_segment (struct ne_seg_image *seg, unsigned target_seg)
+{
+  emit8 (&seg->bytes, 0x50);        /* preserve DOS entry AX */
+  emit_ne_mov_ax_segment (seg, target_seg);
+  emit8 (&seg->bytes, 0x8e);
+  emit8 (&seg->bytes, 0xd8);        /* mov ds, ax */
+  emit8 (&seg->bytes, 0x8e);
+  emit8 (&seg->bytes, 0xc0);        /* mov es, ax */
+  emit8 (&seg->bytes, 0x58);
+}
+
+static uint16_t
+ne_auto_top_para (const struct image *img, unsigned data_seg)
+{
+  uint32_t paras;
+
+  if (img->heap >= ELKS_MAX_HEAP)
+    return 0x0fffu;
+
+  /*
+   * ELKS' OS/2 loader allocates the auto data segment as minalloc plus the
+   * NE stack, argument copy space, and heap.  Use the same paragraph-scale
+   * accounting for the PSP top-of-memory word, rounded up at the byte total
+   * boundary.  If the heap is zero the loader substitutes its small default
+   * heap; 4 KiB matches the converter's flat-image default reserve.
+   */
+  paras = align_para (img->ne_seg[data_seg].min_alloc);
+  paras += align_para ((uint32_t) img->stack + NE_ARG_SLACK
+                       + (img->heap ? img->heap : 4096u));
+  if (paras > 0x0fffu)
+    paras = 0x0fffu;
+  return (uint16_t) paras;
+}
+
 static int
 mz_dos_alloc_request_is_free_probe (const uint8_t *image, size_t image_len,
                                     size_t fn_pos)
@@ -840,13 +1055,16 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
                       const struct runtime_info *rt,
                       int raw_keyboard, int direct_video, int install_int16,
                       uint16_t int16_handler,
-                      uint16_t psp_top_para)
+                      uint16_t psp_top_para, int separate_psp,
+                      unsigned psp_seg, unsigned psp_top_seg,
+                      unsigned env_seg, uint16_t initial_sp)
 {
   static const uint8_t prefix[] = {
     0x55, 0x89, 0xe5,       /* push bp; mov bp, sp */
     0x50, 0x53, 0x51, 0x52, /* save ax,bx,cx,dx */
-    0x56, 0x57,             /* save si,di */
-    0x16, 0x07,             /* es = ss */
+    0x56, 0x57              /* save si,di */
+  };
+  static const uint8_t copy_tail[] = {
     0xbf, 0x81, 0x00,       /* di = command tail text */
     0x31, 0xc9,             /* cx = tail length */
     0x8b, 0x56, 0x02,       /* dx = argc */
@@ -875,28 +1093,54 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
     emit_install_int21_vector (&seg->bytes, int21_handler);
   if (install_int16)
     emit_install_int16_vector (&seg->bytes, int16_handler);
+
+  vec_append (&seg->bytes, prefix, sizeof (prefix));
+  if (separate_psp)
+    emit_ne_set_es_to_segment (seg, psp_seg);
+  else
+    {
+      emit8 (&seg->bytes, 0x16);
+      emit8 (&seg->bytes, 0x07);        /* es = ss */
+    }
   if (psp_top_para)
     {
-      emit8 (&seg->bytes, 0x50);        /* preserve ax */
-      emit8 (&seg->bytes, 0x8c);
-      emit8 (&seg->bytes, 0xc8);        /* ax = cs */
+      if (separate_psp)
+        emit_ne_mov_ax_segment (seg, psp_top_seg);
+      else
+        {
+          emit8 (&seg->bytes, 0x8c);
+          emit8 (&seg->bytes, 0xc8);    /* ax = cs */
+        }
       emit8 (&seg->bytes, 0x05);
       emit16 (&seg->bytes, psp_top_para);
-      emit8 (&seg->bytes, 0x36);
+      emit8 (&seg->bytes, 0x26);
       emit8 (&seg->bytes, 0xa3);
-      emit16 (&seg->bytes, 0x0002);     /* ss:[PSP top] = cs + top */
+      emit16 (&seg->bytes, 0x0002);     /* es:[PSP top] = base + top */
       emit8 (&seg->bytes, 0x31);
       emit8 (&seg->bytes, 0xc0);
-      emit8 (&seg->bytes, 0x36);
+      emit8 (&seg->bytes, 0x26);
       emit8 (&seg->bytes, 0xa3);
-      emit16 (&seg->bytes, 0x002c);     /* ss:[environment] = 0 */
-      emit8 (&seg->bytes, 0x58);
+      emit16 (&seg->bytes, 0x002c);     /* es:[environment] = 0 */
     }
-  vec_append (&seg->bytes, prefix, sizeof (prefix));
+  if (separate_psp)
+    {
+      emit_ne_mov_ax_segment (seg, env_seg);
+      emit8 (&seg->bytes, 0x26);
+      emit8 (&seg->bytes, 0xa3);
+      emit16 (&seg->bytes, 0x002c);     /* es:[environment] = empty block */
+    }
+  vec_append (&seg->bytes, copy_tail, sizeof (copy_tail));
   if (direct_video)
     emit_save_initial_video_mode (&seg->bytes, rt);
   if (raw_keyboard)
     emit_stdin_raw_mode (&seg->bytes, rt);
+  if (separate_psp)
+    emit_ne_set_ds_es_to_segment (seg, psp_seg);
+  if (initial_sp)
+    {
+      emit8 (&seg->bytes, 0xbc);        /* mov sp, DOS header SP */
+      emit16 (&seg->bytes, initial_sp);
+    }
   if (seg->bytes.len + 5u > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
 
@@ -925,6 +1169,9 @@ cap_ne_auto_heap (struct image *img, unsigned data_seg,
   uint32_t base = (uint32_t) img->ne_seg[data_seg].min_alloc
                   + img->stack + NE_ARG_SLACK;
   uint32_t max_heap;
+
+  if (img->heap >= ELKS_MAX_HEAP)
+    return;
 
   if (base >= ELKS_MAX_HEAP)
     {
@@ -957,12 +1204,17 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
   size_t image_len = exe_size - (size_t) h->cparhdr * 16u;
   uint32_t code_base = (uint32_t) code_para << 4;
   uint32_t data_base = (uint32_t) data_para << 4;
+  uint32_t entry_phys = ((uint32_t) h->cs << 4) + h->ip;
   uint32_t code_end = data_base > code_base && data_base < image_len
                       ? data_base : (uint32_t) image_len;
   size_t data_len = data_base < image_len ? image_len - data_base : 0;
   unsigned data_seg;
+  unsigned psp_seg = 0;
+  unsigned psp_top_seg = 0;
+  unsigned env_seg = 0;
   int entry_seg;
   int runtime_in_code;
+  int separate_psp = 0;
   uint16_t dos_alloc_max;
   uint32_t pos;
   uint16_t psp_top_para = 0;
@@ -973,7 +1225,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
   init_image_memory (img, opts);
   dos_alloc_max = mz_image_max_dos_alloc_request (image, image_len);
   if (!opts->heap_set)
-    img->heap = mz_heap_from_minalloc (h->minalloc);
+    img->heap = mz_heap_from_allocs (h->minalloc, h->maxalloc);
   if (!opts->stack_set)
     {
       img->stack = (h->sp != 0 && h->sp <= 32768u) ? h->sp : ELKS_DOSISH_STACK;
@@ -1007,7 +1259,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
 
   runtime_in_code = data_base >= image_len && image_len <= ELKS_MAX16
                     && mz_entry_loads_ds_from_cs (image, image_len,
-                                                  code_base + h->ip);
+                                                  entry_phys);
   if (runtime_in_code)
     {
       enum
@@ -1113,7 +1365,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
       img->ne_seg[place].flags |= NESEG_RELOCINFO;
     }
 
-  entry_seg = ne_find_segment_for_phys (img, code_base + h->ip);
+  entry_seg = ne_find_segment_for_phys (img, entry_phys);
   if (entry_seg < 0)
     die ("MZ entry point is outside selected NE code segments");
   img->ne_entry_seg = 0;
@@ -1132,6 +1384,15 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
   if (stats->bios_keyboard_input)
     stats->dynamic_int16 = 1;
 
+  if (!runtime_in_code)
+    {
+      separate_psp = 1;
+      env_seg = ne_add_env_segment (img);
+      psp_seg = ne_add_psp_segment (img);
+      psp_top_seg = data_seg;
+      psp_top_para = ne_auto_top_para (img, data_seg);
+    }
+
   if (stats->dynamic_int21 || stats->dynamic_int16)
     {
       uint16_t int21_handler = stats->dynamic_int21
@@ -1141,20 +1402,23 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
 
       append_ne_mz_startup (img, 0, (unsigned) entry_seg,
                             ne_local_offset (&img->ne_seg[entry_seg],
-                                             code_base + h->ip),
+                                             entry_phys),
                             stats->dynamic_int21, int21_handler,
                             &rt,
                             stats->bios_keyboard_input,
                             stats->direct_video_output,
                             stats->dynamic_int16, int16_handler,
-                            psp_top_para);
+                            psp_top_para, separate_psp, psp_seg, psp_top_seg,
+                            env_seg, h->sp);
     }
   else
     append_ne_mz_startup (img, 0, (unsigned) entry_seg,
                           ne_local_offset (&img->ne_seg[entry_seg],
-                                           code_base + h->ip),
+                                           entry_phys),
                           0, 0, &rt, stats->bios_keyboard_input,
-                          stats->direct_video_output, 0, 0, psp_top_para);
+                          stats->direct_video_output, 0, 0,
+                          psp_top_para, separate_psp, psp_seg, psp_top_seg,
+                          env_seg, h->sp);
   if (img->ne_seg[0].bytes.len > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
   img->ne_seg[0].mz_len = (uint32_t) img->ne_seg[0].bytes.len;
@@ -1181,6 +1445,7 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
   uint16_t data_para;
   uint32_t code_base;
   uint32_t data_base;
+  uint32_t entry_phys;
   size_t text_len;
   size_t data_len;
   uint16_t i;
@@ -1197,14 +1462,33 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
   image_len = exe_size - header_size;
   reject_known_mz_packers (input, input_len, image, image_len, &h);
 
-  code_para = opts->mz_code_set ? opts->mz_code_seg : h.cs;
+  code_para = opts->mz_code_set
+              ? opts->mz_code_seg
+              : mz_code_para_covering_relocs (image, image_len, input, &h,
+                                              h.cs);
+  entry_phys = ((uint32_t) h.cs << 4) + h.ip;
   data_para = opts->mz_data_set
               ? opts->mz_data_seg
               : guess_mz_data_para (image, image_len, input, &h, code_para);
+  if (!opts->mz_data_set)
+    data_para = mz_stack_alias_para (image, image_len, input, &h, data_para);
+  if (!opts->mz_data_set && data_para == h.ss && h.sp != 0
+      && ((uint32_t) h.ss << 4) >= image_len)
+    {
+      /*
+       * If the MZ stack segment starts beyond the initialized image, keep the
+       * generated auto-data segment there.  Older C runtimes commonly use a
+       * separate uninitialized stack/PSP area while addressing initialized
+       * constants through relocated code-segment values.  Treating an earlier
+       * relocated constant segment as auto-data gives ELKS a tiny break value
+       * and makes those runtimes trip stack checks before they can process
+       * their DOS command tail.
+       */
+      data_para = h.ss;
+    }
   if (!opts->mz_data_set
       && image_len <= ELKS_MAX16
-      && mz_entry_loads_ds_from_cs (image, image_len,
-                                    ((uint32_t) code_para << 4) + h.ip))
+      && mz_entry_loads_ds_from_cs (image, image_len, entry_phys))
     data_para = align_para ((uint32_t) image_len);
 
   code_base = (uint32_t) code_para << 4;
@@ -1216,7 +1500,8 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
     text_len = (size_t) (data_base - code_base);
   else
     text_len = image_len - code_base;
-  if ((uint32_t) h.ip >= text_len)
+  if (entry_phys < code_base
+      || entry_phys - code_base >= (uint32_t) text_len)
     die ("MZ entry point is outside the selected text segment");
   data_len = data_base < image_len ? image_len - data_base : 0;
 
@@ -1235,9 +1520,9 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
          "use the default --mz-output=os2 with CONFIG_EXEC_OS2=y");
 
   init_image_memory (img, opts);
-  img->entry = h.ip;
+  img->entry = (uint16_t) (entry_phys - code_base);
   if (!opts->heap_set)
-    img->heap = mz_heap_from_minalloc (h.minalloc);
+    img->heap = mz_heap_from_allocs (h.minalloc, h.maxalloc);
   if (!opts->stack_set)
     img->stack = (h.sp != 0 && h.sp <= 32768u) ? h.sp : ELKS_DOSISH_STACK;
 
