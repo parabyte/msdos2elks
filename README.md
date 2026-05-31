@@ -157,13 +157,13 @@ too small to replace in place, startup installs a process-local `int 21h`
 handler in the real-mode interrupt vector table so shared DOS wrappers can
 dispatch through the same ELKS adapters.
 
-BIOS video conversion is intentionally limited to CGA, MDA, and EGA class
-modes.  Static mode-set calls for MDA text mode 07h and EGA graphics modes
-0Dh-10h are allowed and passed through to the machine BIOS.  Static VGA modes
-11h-13h, later modes, and VGA/MCGA-only BIOS services are refused in strict
-mode so a VGA program is not converted into a misleading ELKS binary.  Known
-VGA-only loader/resource signatures are also refused after any supported
-PKLITE reveal.
+BIOS video conversion passes static `int 10h` video services through to the
+machine BIOS whenever the function number is known.  Mode-set calls record the
+requested BIOS mode; graphics and adapter-specific modes also claim the ELKS
+console graphics lock and raw keyboard path so ELKS console output does not
+paint over DOS programs that draw directly through video hardware.  The ROM
+BIOS and target machine still decide which CGA, MDA, EGA, VGA, MCGA, or
+adapter-specific modes are actually available.
 
 Supported DOS functions:
 
@@ -202,16 +202,20 @@ Supported BIOS compatibility calls:
 int 10h AH=00h,01h,02h,05h,06h,07h
               video mode/cursor/page and scroll compatibility; mode set calls
               record the mode and pass through to BIOS for real hardware setup
-int 10h AH=03h,08h,0Fh,1Ah
-              cursor/read char stubs, BIOS video-mode query passthrough,
-              no-VGA display info stub
+int 10h AH=03h,08h,0Fh
+              cursor/read char and BIOS video-mode query passthrough
 int 10h AH=09h,0Ah,0Eh
               BIOS text/teletype passthrough for text-mode and title-screen
               rendering
 int 10h AH=0Ch,0Dh
               BIOS pixel write/read passthrough for CGA/EGA graphics modes
-int 10h AH=0Bh,12h
-              palette and EGA alternate-select/query BIOS passthrough
+int 10h AH=0Bh
+              palette BIOS passthrough
+int 10h AH=12h,1Ah,30h
+              conservative no-EGA/VGA/enhanced-adapter probe stubs, so old
+              DOS libraries keep using their legacy direct-video paths
+int 10h other static AH
+              generic BIOS video passthrough
 int 16h AH=00h,01h,02h,10h,11h,12h
               stdin-backed blocking reads, no-key status, shift-flag stubs
 int 1Ah AH=00h,01h,02h,04h

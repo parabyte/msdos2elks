@@ -10,48 +10,6 @@ is_zip_archive (const uint8_t *input, size_t input_len)
          || (input[2] == 0x07 && input[3] == 0x08);
 }
 
-static int
-buffer_has_ascii (const uint8_t *input, size_t input_len,
-                  const char *needle)
-{
-  size_t len = strlen (needle);
-  size_t i;
-
-  if (len == 0 || len > input_len)
-    return 0;
-  for (i = 0; i + len <= input_len; i++)
-    if (memcmp (input + i, needle, len) == 0)
-      return 1;
-  return 0;
-}
-
-static int
-has_vga_application_signature (const uint8_t *input, size_t input_len)
-{
-  static const char *const sigs[] =
-  {
-    "For VGA game",
-    "vgagr0.dat",
-    "vgaspec0.dat",
-    "vgamain.dat"
-  };
-  size_t i;
-
-  for (i = 0; i < sizeof (sigs) / sizeof (sigs[0]); i++)
-    if (buffer_has_ascii (input, input_len, sigs[i]))
-      return 1;
-  return 0;
-}
-
-static int
-has_borland_cga_bgi_signature (const uint8_t *input, size_t input_len)
-{
-  return buffer_has_ascii (input, input_len,
-                           "BGI Device Driver (CGA)")
-         && buffer_has_ascii (input, input_len,
-                              "320 x 200 CGA");
-}
-
 int
 main (int argc, char **argv)
 {
@@ -83,10 +41,6 @@ main (int argc, char **argv)
                            opts.verbose))
     convert_input = revealed;
 
-  if (has_vga_application_signature (convert_input, convert_len))
-    die ("input appears to be a VGA application; CGA, MDA, and EGA only");
-  stats.allow_bgi_multimode_video =
-    has_borland_cga_bgi_signature (convert_input, convert_len);
   if (opts.format == FMT_EXE || (opts.format == FMT_AUTO && is_mz))
     stats.dynamic_int21 = 1;
 
@@ -109,23 +63,26 @@ main (int argc, char **argv)
         fprintf (stderr,
                  "msdos2elks: patched=%u unsupported=%u dynamic-int21=%u"
                  " dynamic-int16=%u bios-keyboard=%u"
-                 " com-segment-fixes=%u stack-fixes=%u os2-ne-segs=%u\n",
+                 " direct-video=%u com-segment-fixes=%u stack-fixes=%u"
+                 " os2-ne-segs=%u\n",
                  stats.patched, stats.unsupported,
                  stats.dynamic_int21 ? 1u : 0u,
                  stats.dynamic_int16 ? 1u : 0u,
-                 stats.bios_keyboard_input ? 1u : 0u, stats.com_segfix,
-                 stats.stackfix, img.ne_nsegs);
+                 stats.bios_keyboard_input ? 1u : 0u,
+                 stats.direct_video_output ? 1u : 0u,
+                 stats.com_segfix, stats.stackfix, img.ne_nsegs);
       else
         fprintf (stderr,
                  "msdos2elks: patched=%u unsupported=%u dynamic-int21=%u"
                  " dynamic-int16=%u bios-keyboard=%u"
-                 " com-segment-fixes=%u stack-fixes=%u text=%u data=%u"
-                 " trel=%u drel=%u\n",
+                 " direct-video=%u com-segment-fixes=%u stack-fixes=%u"
+                 " text=%u data=%u trel=%u drel=%u\n",
                  stats.patched, stats.unsupported,
                  stats.dynamic_int21 ? 1u : 0u,
                  stats.dynamic_int16 ? 1u : 0u,
-                 stats.bios_keyboard_input ? 1u : 0u, stats.com_segfix,
-                 stats.stackfix,
+                 stats.bios_keyboard_input ? 1u : 0u,
+                 stats.direct_video_output ? 1u : 0u,
+                 stats.com_segfix, stats.stackfix,
                  (unsigned) img.text.len, (unsigned) img.data.len,
                  (unsigned) img.trel.len, (unsigned) img.drel.len);
     }

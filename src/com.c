@@ -53,16 +53,17 @@ convert_com (const uint8_t *input, size_t input_len, const struct options *opts,
       uint16_t int16_handler = stats->dynamic_int16
         ? append_int16_interrupt_handler (&img->text, &rt) : 0;
 
-      install_com_return_exit (img);
+      install_com_return_exit (img, &rt);
       append_com_argv_startup (img, stats->dynamic_int21, int21_handler,
                                &rt,
                                stats->bios_keyboard_input,
+                               stats->direct_video_output,
                                stats->dynamic_int16, int16_handler);
     }
   else
     {
-      install_com_return_exit (img);
+      install_com_return_exit (img, &rt);
       append_com_argv_startup (img, 0, 0, &rt, stats->bios_keyboard_input,
-                               0, 0);
+                               stats->direct_video_output, 0, 0);
     }
 }

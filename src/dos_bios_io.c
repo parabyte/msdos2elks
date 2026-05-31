@@ -579,7 +579,68 @@ emit_free_stub (struct byte_vec *v, const struct runtime_info *rt)
 }
 
 static void
-emit_exit_stub (struct byte_vec *v, int use_al)
+emit_release_console_video (struct byte_vec *v, const struct runtime_info *rt)
+{
+  enum
+  {
+    ELKS_SYS_IOCTL = 54,
+    ELKS_DCREL_GRAPH = 0x4402,
+    ELKS_DCREL_KRAW = 0x4404
+  };
+  size_t done_rel;
+
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+
+  emit8 (v, 0x81);
+  emit8 (v, 0x3e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit16 (v, 0xffffu);      /* no console fd was opened by startup */
+  emit8 (v, 0x74);
+  done_rel = v->len;
+  emit8 (v, 0);
+
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit8 (v, 0xb9);
+  emit16 (v, ELKS_DCREL_KRAW);
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* dx = NULL */
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_IOCTL);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit8 (v, 0xb9);
+  emit16 (v, ELKS_DCREL_GRAPH);
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* dx = NULL */
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_IOCTL);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+
+  emit8 (v, 0xc7);
+  emit8 (v, 0x06);
+  emit16 (v, rt->keyboard_mode_off);
+  emit16 (v, 0);
+
+  v->data[done_rel] = (uint8_t) (v->len - (done_rel + 1u));
+  emit8 (v, 0x5a);          /* pop dx */
+  emit8 (v, 0x59);          /* pop cx */
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0x58);          /* pop ax */
+}
+
+static void
+emit_exit_stub (struct byte_vec *v, int use_al,
+                const struct runtime_info *rt)
 {
   if (use_al)
     {
@@ -593,6 +654,7 @@ emit_exit_stub (struct byte_vec *v, int use_al)
       emit8 (v, 0xbb);
       emit16 (v, 0);        /* bx = 0 */
     }
+  emit_release_console_video (v, rt);
   emit8 (v, 0xb8);
   emit16 (v, 1);            /* exit */
   emit8 (v, 0xcd);
@@ -1028,7 +1090,7 @@ emit_ascii_scan_case (struct byte_vec *v, uint8_t ascii, uint8_t scan,
   emit16 (v, 0);            /* jmp return */
 }
 
-static void __attribute__ ((unused))
+static void
 emit_bios_raw_scancode_read_key_stub (struct byte_vec *v,
                                       const struct runtime_info *rt)
 {
@@ -1269,6 +1331,7 @@ static void
 emit_bios_read_key_stub (struct byte_vec *v, const struct runtime_info *rt)
 {
   size_t no_pending_rel;
+  size_t ascii_jmp;
 
   emit8 (v, 0xa1);
   emit16 (v, rt->keyboard_pending_off);
@@ -1285,14 +1348,36 @@ emit_bios_read_key_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0xc3);
   patch_rel8 (v, no_pending_rel, v->len);
 
+  emit8 (v, 0x83);
+  emit8 (v, 0x3e);
+  emit16 (v, rt->keyboard_mode_off);
+  emit8 (v, 1);
+  emit8 (v, 0x74);
+  emit8 (v, 0x03);          /* je raw_scancode_read */
+  emit8 (v, 0xe9);
+  ascii_jmp = v->len;
+  emit16 (v, 0);
+  emit_bios_raw_scancode_read_key_stub (v, rt);
+  patch_rel16 (v, ascii_jmp, v->len);
   emit_bios_ascii_read_key_stub (v, rt);
 }
 
 static void
 emit_bios_key_status_stub (struct byte_vec *v, const struct runtime_info *rt)
 {
+  enum
+  {
+    ELKS_SYS_SELECT = 63
+  };
+  size_t no_pending_rel;
+  size_t no_fd_jmp;
+  size_t not_ready_select_jmp;
   size_t not_ready_jmp;
-  size_t ret_jmps[32];
+  size_t raw_map_jmp;
+  size_t raw_break_jmp;
+  size_t raw_prefix_jmp;
+  size_t ascii_done_jmp;
+  size_t ret_jmps[96];
   size_t nret = 0;
   size_t ret;
   size_t i;
@@ -1308,10 +1393,116 @@ emit_bios_key_status_stub (struct byte_vec *v, const struct runtime_info *rt)
     { '8', 0x09 },  { '9', 0x0a },  { 'd', 0x20 }, { 'D', 0x20 },
     { 'k', 0x25 },  { 'K', 0x25 }
   };
+  static const struct
+  {
+    uint8_t scan;
+    uint8_t ascii;
+  } raw_scan_cases[] =
+  {
+    { 0x01, 0x1b }, { 0x0c, '-' },  { 0x0d, '=' },  { 0x0e, 0x08 },
+    { 0x0f, 0x09 }, { 0x10, 'q' },  { 0x11, 'w' },  { 0x12, 'e' },
+    { 0x13, 'r' },  { 0x14, 't' },  { 0x15, 'y' },  { 0x16, 'u' },
+    { 0x17, 'i' },  { 0x18, 'o' },  { 0x19, 'p' },  { 0x1a, '[' },
+    { 0x1b, ']' },  { 0x1c, 0x0d }, { 0x1e, 'a' },  { 0x1f, 's' },
+    { 0x20, 'd' },  { 0x21, 'f' },  { 0x22, 'g' },  { 0x23, 'h' },
+    { 0x24, 'j' },  { 0x25, 'k' },  { 0x26, 'l' },  { 0x27, ';' },
+    { 0x28, '\'' }, { 0x29, '`' },  { 0x2b, '\\' }, { 0x2c, 'z' },
+    { 0x2d, 'x' },  { 0x2e, 'c' },  { 0x2f, 'v' },  { 0x30, 'b' },
+    { 0x31, 'n' },  { 0x32, 'm' },  { 0x33, ',' },  { 0x34, '.' },
+    { 0x35, '/' },  { 0x39, ' ' }
+  };
 
   emit8 (v, 0x53);          /* push bx */
   emit8 (v, 0x51);          /* push cx */
   emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x56);          /* push si */
+  emit8 (v, 0x57);          /* push di */
+
+  /*
+   * BIOS INT 16h AH=01h reports whether a key is waiting, but it must
+   * not remove that key from the BIOS queue.  The runtime keeps one
+   * already-translated key word in keyboard_pending.  If it is nonzero,
+   * return it immediately with ZF clear.
+   */
+  emit8 (v, 0xa1);
+  emit16 (v, rt->keyboard_pending_off);
+  emit8 (v, 0x09);
+  emit8 (v, 0xc0);
+  emit8 (v, 0x74);
+  no_pending_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xe9);
+  ret_jmps[nret++] = v->len;
+  emit16 (v, 0);
+  patch_rel8 (v, no_pending_rel, v->len);
+
+  /*
+   * Poll before reading.  Direct-video programs put the ELKS console in
+   * raw keyboard mode so DOS programs can receive PC scan codes.  In
+   * that mode a plain read may wait for hardware input; a BIOS status
+   * query is supposed to return immediately when no key is available.
+   * The zero timeval at io_buf+4 makes select an immediate poll.
+   */
+  emit8 (v, 0x81);
+  emit8 (v, 0x3e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit16 (v, 0xffffu);
+  emit8 (v, 0x75);
+  emit8 (v, 0x03);          /* jne poll_fd */
+  emit8 (v, 0xe9);
+  no_fd_jmp = v->len;
+  emit16 (v, 0);
+  emit8 (v, 0xbe);
+  emit16 (v, rt->io_buf_off);
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->keyboard_fd_off);
+  emit8 (v, 0x88);
+  emit8 (v, 0xd9);          /* cl = bl */
+  emit8 (v, 0xb8);
+  emit16 (v, 1);
+  emit8 (v, 0xd3);
+  emit8 (v, 0xe0);          /* ax = 1 << fd */
+  emit8 (v, 0x89);
+  emit8 (v, 0x04);          /* read fd set */
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x02);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x04);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x06);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x08);
+  emit8 (v, 0x89);
+  emit8 (v, 0x44);
+  emit8 (v, 0x0a);
+  emit8 (v, 0x43);          /* nfds = fd + 1 */
+  emit8 (v, 0x89);
+  emit8 (v, 0xf1);          /* cx = readfds */
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* dx = NULL writefds */
+  emit8 (v, 0x31);
+  emit8 (v, 0xff);          /* di = NULL exceptfds */
+  emit8 (v, 0xbe);
+  emit16 (v, (uint16_t) (rt->io_buf_off + 4u)); /* zero timeout */
+  emit8 (v, 0xb8);
+  emit16 (v, ELKS_SYS_SELECT);
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);
+  emit8 (v, 0x7f);
+  emit8 (v, 0x03);          /* jg read_ready_byte */
+  emit8 (v, 0xe9);
+  not_ready_select_jmp = v->len;
+  emit16 (v, 0);
+
   emit8 (v, 0x8b);
   emit8 (v, 0x1e);
   emit16 (v, rt->keyboard_fd_off);
@@ -1333,6 +1524,23 @@ emit_bios_key_status_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit16 (v, 0);
   emit8 (v, 0xa0);
   emit16 (v, rt->io_buf_off);
+
+  /*
+   * When the ELKS console is in direct raw keyboard mode, reads return
+   * PC scan-code bytes.  Otherwise they return ASCII bytes from normal
+   * raw terminal mode.  Translate whichever form is active into the BIOS
+   * AX layout: AH is the scan code, AL is ASCII when one exists.
+   */
+  emit8 (v, 0x83);
+  emit8 (v, 0x3e);
+  emit16 (v, rt->keyboard_mode_off);
+  emit8 (v, 1);
+  emit8 (v, 0x75);
+  emit8 (v, 0x03);          /* jne ascii_byte */
+  emit8 (v, 0xe9);
+  raw_map_jmp = v->len;
+  emit16 (v, 0);
+
   emit8 (v, 0x3c);
   emit8 (v, 0x0a);
   emit8 (v, 0x75);
@@ -1345,11 +1553,44 @@ emit_bios_key_status_stub (struct byte_vec *v, const struct runtime_info *rt)
     emit_ascii_scan_case (v, scan_cases[i].ascii, scan_cases[i].scan,
                           ret_jmps, &nret,
                           sizeof (ret_jmps) / sizeof (ret_jmps[0]));
+  emit8 (v, 0xe9);
+  ascii_done_jmp = v->len;
+  emit16 (v, 0);
+
+  patch_rel16 (v, raw_map_jmp, v->len);
+  emit8 (v, 0xa8);
+  emit8 (v, 0x80);          /* ignore raw break codes */
+  emit8 (v, 0x74);
+  emit8 (v, 0x03);          /* jz raw_make_code */
+  emit8 (v, 0xe9);
+  raw_break_jmp = v->len;
+  emit16 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 0xe0);          /* ignore extended prefix this poll */
+  emit8 (v, 0x75);
+  emit8 (v, 0x03);          /* jne raw_not_prefix */
+  emit8 (v, 0xe9);
+  raw_prefix_jmp = v->len;
+  emit16 (v, 0);
+  emit8 (v, 0x88);
+  emit8 (v, 0xc4);          /* ah = raw scan code */
+  emit8 (v, 0x80);
+  emit8 (v, 0xe4);
+  emit8 (v, 0x7f);
+  emit8 (v, 0x30);
+  emit8 (v, 0xc0);          /* al = 0 unless the scan maps to ASCII */
+  for (i = 0; i < sizeof (raw_scan_cases) / sizeof (raw_scan_cases[0]); i++)
+    emit_scan_ascii_case (v, raw_scan_cases[i].scan,
+                          raw_scan_cases[i].ascii, ret_jmps, &nret,
+                          sizeof (ret_jmps) / sizeof (ret_jmps[0]));
   ret = v->len;
+  patch_rel16 (v, ascii_done_jmp, ret);
   for (i = 0; i < nret; i++)
     patch_rel16 (v, ret_jmps[i], ret);
   emit8 (v, 0xa3);
   emit16 (v, rt->keyboard_pending_off);
+  emit8 (v, 0x5f);
+  emit8 (v, 0x5e);
   emit8 (v, 0x5a);
   emit8 (v, 0x59);
   emit8 (v, 0x5b);
@@ -1359,8 +1600,14 @@ emit_bios_key_status_stub (struct byte_vec *v, const struct runtime_info *rt)
 
   put16 (v->data + not_ready_jmp,
          (uint16_t) (v->len - (not_ready_jmp + 2u)));
+  patch_rel16 (v, no_fd_jmp, v->len);
+  patch_rel16 (v, not_ready_select_jmp, v->len);
+  patch_rel16 (v, raw_break_jmp, v->len);
+  patch_rel16 (v, raw_prefix_jmp, v->len);
   emit8 (v, 0x31);
   emit8 (v, 0xc0);
+  emit8 (v, 0x5f);
+  emit8 (v, 0x5e);
   emit8 (v, 0x5a);
   emit8 (v, 0x59);
   emit8 (v, 0x5b);
@@ -1494,7 +1741,7 @@ emit_enable_console_raw_scancodes (struct byte_vec *v,
   emit8 (v, 0x24);
   emit8 (v, 0x7f);
   emit8 (v, 0x3c);
-  emit8 (v, 0xff);          /* raw console locking is deferred by default */
+  emit8 (v, 0x04);          /* BIOS modes 00h-03h are text modes */
   emit8 (v, 0x72);
   text_mode_rel = v->len;
   emit8 (v, 0);
@@ -1591,25 +1838,40 @@ emit_bios_passthrough_stub (struct byte_vec *v, uint8_t intr, uint8_t fn)
 }
 
 static void
-emit_bios_get_display_combination_stub (struct byte_vec *v)
+emit_bios_no_display_combo_stub (struct byte_vec *v)
 {
+  /*
+   * INT 10h AH=1Ah is a VGA/MCGA display-combination query.  An
+   * XT-class DOS program that explicitly selects a BIOS video mode is
+   * still allowed to do so, but old graphics libraries often use this
+   * query only to choose between legacy CGA/EGA/MDA code and newer
+   * adapter-specific code.  Report the conservative pre-VGA result so
+   * the program keeps using the broad legacy direct-memory path.
+   */
   emit8 (v, 0x31);
-  emit8 (v, 0xc0);          /* AL != 1Ah: no VGA/MCGA display-combo BIOS. */
+  emit8 (v, 0xc0);          /* AL != 1Ah: no display-combo BIOS */
   emit8 (v, 0x31);
-  emit8 (v, 0xdb);
+  emit8 (v, 0xdb);          /* BX = 0 */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
 
 static void
-emit_bios_no_vga_info_stub (struct byte_vec *v)
+emit_bios_no_enhanced_video_info_stub (struct byte_vec *v)
 {
+  /*
+   * INT 10h AH=30h is not part of the original PC/XT BIOS video API.
+   * Some DOS libraries probe it before choosing VGA/MCGA paths whose
+   * memory layout does not match the legacy CGA/EGA/MDA code they also
+   * contain.  Return zero registers with carry clear: a normal, harmless
+   * "no enhanced information" result for conservative direct-video use.
+   */
   emit8 (v, 0x31);
-  emit8 (v, 0xc0);          /* ax = 0 */
+  emit8 (v, 0xc0);          /* AX = 0 */
   emit8 (v, 0x31);
-  emit8 (v, 0xc9);          /* cx = 0 */
+  emit8 (v, 0xc9);          /* CX = 0 */
   emit8 (v, 0x31);
-  emit8 (v, 0xd2);          /* dx = 0 */
+  emit8 (v, 0xd2);          /* DX = 0 */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
@@ -1621,6 +1883,21 @@ emit_bios_set_palette_stub (struct byte_vec *v)
   emit8 (v, 0x0b);                 /* mov ah, 0Bh */
   emit8 (v, 0xcd);
   emit8 (v, 0x10);                 /* let BIOS update CGA palette state */
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+}
+
+static void
+emit_bios_no_ega_info_stub (struct byte_vec *v)
+{
+  /*
+   * INT 10h AH=12h covers EGA alternate-select functions.  A PC/XT
+   * converter cannot promise that every EGA/VGA direct-memory layout is
+   * safe, so adapter discovery is conservative: leave the caller's query
+   * registers unchanged and return carry clear.  Common DOS libraries
+   * interpret that as "no useful EGA information" and continue down their
+   * CGA/MDA-compatible paths unless they explicitly set another mode.
+   */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
@@ -1688,13 +1965,20 @@ emit_bios_video_stub_for_fn (struct byte_vec *v, uint8_t fn,
       return 1;
     case 0x12:              /* EGA alternate select/query */
       (void) rt;
-      emit_bios_video_passthrough_stub (v, 0x12);
+      emit_bios_no_ega_info_stub (v);
       return 1;
     case 0x1a:              /* get display combination code */
-      emit_bios_get_display_combination_stub (v);
+      (void) rt;
+      emit_bios_no_display_combo_stub (v);
+      return 1;
+    case 0x30:              /* enhanced adapter information */
+      (void) rt;
+      emit_bios_no_enhanced_video_info_stub (v);
       return 1;
     default:
-      return 0;
+      (void) rt;
+      emit_bios_video_passthrough_stub (v, fn);
+      return 1;
     }
 }
 
@@ -1859,7 +2143,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
   switch (fn)
     {
     case 0x00:
-      emit_exit_stub (v, 0);
+      emit_exit_stub (v, 0, rt);
       return 1;
     case 0x01:
       emit_read_char_stub (v, 1, 0, rt);
@@ -1998,7 +2282,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       emit_get_cwd_stub (v);
       return 1;
     case 0x4c:
-      emit_exit_stub (v, 1);
+      emit_exit_stub (v, 1, rt);
       return 1;
     case 0x4d:              /* get child return code */
       emit_success_stub (v);

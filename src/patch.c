@@ -20,22 +20,6 @@ report_unsupported (const struct patch_stats *stats)
 {
   unsigned i;
 
-  if (stats->unsupported_video)
-    {
-      if (stats->first_video_mode_known)
-        fprintf (stderr,
-                 "msdos2elks: unsupported VGA/non-CGA-EGA-MDA video mode"
-                 " %02xh at text offset %04x\n",
-                 stats->first_video_mode,
-                 (unsigned) stats->first_video_offset);
-      else
-        fprintf (stderr,
-                 "msdos2elks: unsupported dynamic BIOS video mode/service"
-                 " AH=%02xh at text offset %04x; refusing possible VGA app\n",
-                 stats->first_video_fn,
-                 (unsigned) stats->first_video_offset);
-    }
-
   for (i = 0; i < stats->first_len; i++)
     {
       if (stats->first[i].known)
@@ -60,34 +44,6 @@ report_unsupported (const struct patch_stats *stats)
   if (stats->unsupported > stats->first_len)
     fprintf (stderr, "msdos2elks: plus %u more unsupported interrupt sites\n",
              stats->unsupported - stats->first_len);
-}
-
-static void
-record_unsupported_video (struct patch_stats *stats, uint32_t off,
-                          uint8_t fn, uint8_t mode, int mode_known)
-{
-  if (stats->unsupported_video == 0)
-    {
-      stats->first_video_offset = off;
-      stats->first_video_fn = fn;
-      stats->first_video_mode = mode;
-      stats->first_video_mode_known = mode_known;
-    }
-  stats->unsupported_video++;
-  record_unsupported (stats, off, 0x10, 1, fn);
-}
-
-static int
-bgi_optional_video_probe (const struct patch_stats *stats, uint8_t fn,
-                          uint8_t mode, int mode_known)
-{
-  if (!stats->allow_bgi_multimode_video)
-    return 0;
-  if (fn == 0x30)
-    return 1;
-  if (fn != 0x00 || !mode_known)
-    return 0;
-  return mode == 0x11u || mode == 0x30u || mode == 0x40u;
 }
 
 static int
@@ -659,16 +615,6 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
 
   patch_bda_keyboard_status_checks (text, stats, rt, &stubs[1][0x01],
                                     covered, original_len);
-  if (stats->allow_bgi_multimode_video)
-    {
-      size_t stub_off = text->len;
-
-      emit_bios_no_vga_info_stub (text);
-      if (stub_off > ELKS_MAX16 || text->len > ELKS_MAX16)
-        die ("text segment grew beyond 64 KiB while adding video stub");
-      stubs[0][0x30] = (uint32_t) stub_off;
-    }
-
   for (i = 0; i + 1u < original_len; )
     {
       uint8_t intr;
@@ -802,27 +748,16 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
 
       if (intr == 0x10 && fn == 0x00)
         {
-          if (!al_known || !bios_video_mode_is_ega_mda_supported (al))
+          if (!al_known || bios_video_mode_needs_console_lock (al))
             {
-              if (bgi_optional_video_probe (stats, fn, al, al_known))
-                {
-                  i += insn_len;
-                  continue;
-                }
-              record_unsupported_video (stats, (uint32_t) i, fn, al,
-                                        al_known);
-              i += insn_len;
-              continue;
+              stats->direct_video_output = 1;
+              stats->bios_keyboard_input = 1;
             }
         }
       else if (intr == 0x10 && fn == 0x30)
         {
-          if (!bgi_optional_video_probe (stats, fn, 0, 0))
-            {
-              record_unsupported_video (stats, (uint32_t) i, fn, 0, 0);
-              i += insn_len;
-              continue;
-            }
+          stats->direct_video_output = 1;
+          stats->bios_keyboard_input = 1;
         }
 
       if (stubs[sbank][fn] == UINT32_MAX)
@@ -854,6 +789,8 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
       stats->patched++;
       if (intr == 0x16 || (intr == 0x21 && dos_keyboard_function (fn)))
         stats->bios_keyboard_input = 1;
+      if (intr == 0x10 && fn != 0x00)
+        stats->direct_video_output = 1;
       i += insn_len;
     }
 

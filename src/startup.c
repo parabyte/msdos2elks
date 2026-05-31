@@ -155,7 +155,8 @@ static void
 append_com_argv_startup (struct image *img, int install_int21,
                          uint16_t int21_handler,
                          const struct runtime_info *rt, int raw_keyboard,
-                         int install_int16, uint16_t int16_handler)
+                         int direct_video, int install_int16,
+                         uint16_t int16_handler)
 {
   static const uint8_t prefix[] = {
     0x55,                   /* push bp */
@@ -224,6 +225,7 @@ append_com_argv_startup (struct image *img, int install_int21,
   vec_append (&img->text, prefix, sizeof (prefix));
   if (raw_keyboard)
     emit_stdin_raw_mode (&img->text, rt);
+  (void) direct_video;
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding COM argv startup");
 
@@ -234,7 +236,7 @@ append_com_argv_startup (struct image *img, int install_int21,
 }
 
 static void
-install_com_return_exit (struct image *img)
+install_com_return_exit (struct image *img, const struct runtime_info *rt)
 {
   size_t exit_off;
   uint16_t rel;
@@ -242,7 +244,7 @@ install_com_return_exit (struct image *img)
   if (img->text.len < 3u)
     die ("COM text segment is too small for return-exit trampoline");
   exit_off = img->text.len;
-  emit_exit_stub (&img->text, 0);
+  emit_exit_stub (&img->text, 0, rt);
   if (exit_off > ELKS_MAX16 || img->text.len > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding COM return exit");
 
@@ -255,7 +257,8 @@ static void
 append_mz_argv_startup (struct image *img, uint16_t original_entry,
                         int install_int21, uint16_t int21_handler,
                         const struct runtime_info *rt, int raw_keyboard,
-                        int install_int16, uint16_t int16_handler)
+                        int direct_video, int install_int16,
+                        uint16_t int16_handler)
 {
   static const uint8_t prefix[] = {
     0x55,                   /* push bp */
@@ -324,6 +327,7 @@ append_mz_argv_startup (struct image *img, uint16_t original_entry,
   vec_append (&img->text, prefix, sizeof (prefix));
   if (raw_keyboard)
     emit_stdin_raw_mode (&img->text, rt);
+  (void) direct_video;
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding MZ argv startup");
 

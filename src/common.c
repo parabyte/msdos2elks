@@ -91,12 +91,25 @@ emit32 (struct byte_vec *v, uint32_t l)
 }
 
 static int
-bios_video_mode_is_ega_mda_supported (uint8_t mode)
+bios_video_mode_is_text (uint8_t mode)
 {
   mode &= 0x7fu;            /* bit 7 requests no clear on EGA/VGA BIOSes. */
-  if (mode <= 0x07u)
-    return 1;               /* CGA text/graphics plus MDA mode 7. */
-  return mode >= 0x0du && mode <= 0x10u; /* EGA graphics modes. */
+  return mode <= 0x03u || mode == 0x07u;
+}
+
+static int
+bios_video_mode_needs_console_lock (uint8_t mode)
+{
+  /*
+   * BIOS modes 00h-03h are CGA text modes and 07h is MDA text mode on
+   * IBM PC/XT-class display hardware.  Other mode numbers are graphics
+   * modes or adapter-specific extensions.  A converted DOS program using
+   * those modes may draw directly through B000h/B800h/A000h video memory,
+   * so the generated runtime asks ELKS to stop console painting while the
+   * program owns the display.  Unsupported adapter-specific modes are still
+   * handed to the ROM BIOS; the converter does not emulate or validate them.
+   */
+  return !bios_video_mode_is_text (mode);
 }
 
 static void

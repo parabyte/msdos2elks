@@ -103,6 +103,7 @@ enqueue_candidates ()
 
   find "$dir" -type f \( -iname '*.exe' -o -iname '*.com' -o -iname '*.zip' \
        -o -iname '*.1' -o -iname '*.2' -o -iname '*.3' -o -iname '*.dat' \) \
+       ! -path '*/__MACOSX/*' ! -name '._*' ! -name '.DS_Store' \
        -printf '%s\t%p\n' 2>/dev/null \
     | sort -n \
     | cut -f2- >> "$queue_file"

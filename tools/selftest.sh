@@ -36,8 +36,12 @@ mda_input=$tmp/mda.com
 mda_output=$tmp/mda.elks
 vga_input=$tmp/vga.com
 vga_output=$tmp/vga.elks
-vga_sig_input=$tmp/vgasig.com
-vga_sig_output=$tmp/vgasig.elks
+ega_query_input=$tmp/egaquery.com
+ega_query_output=$tmp/egaquery.elks
+svga_probe_input=$tmp/svgaprobe.com
+svga_probe_output=$tmp/svgaprobe.elks
+display_combo_input=$tmp/displaycombo.com
+display_combo_output=$tmp/displaycombo.elks
 log=$tmp/converter.log
 
 printf '\264\011\272\014\001\315\041\270\000\114\315\041Hi$' > "$input"
@@ -48,7 +52,9 @@ printf '\270\004\000\315\020\267\001\060\333\264\013\315\020\270\000\114\315\041
 printf '\270\020\000\315\020\270\000\114\315\041' > "$ega_input"
 printf '\270\007\000\315\020\270\000\114\315\041' > "$mda_input"
 printf '\270\023\000\315\020\270\000\114\315\041' > "$vga_input"
-printf '\270\000\114\315\041vgagr0.dat' > "$vga_sig_input"
+printf '\263\020\264\022\315\020\270\000\114\315\041' > "$ega_query_input"
+printf '\264\060\315\020\270\000\114\315\041' > "$svga_probe_input"
+printf '\270\000\032\315\020\270\000\114\315\041' > "$display_combo_input"
 
 if ! "$converter" --verbose "$input" "$output" > "$log" 2>&1; then
   cat "$log" >&2
@@ -114,26 +120,53 @@ if ! "$converter" --verbose "$mda_input" "$mda_output" >> "$log" 2>&1; then
   exit 1
 fi
 
-if "$converter" --verbose "$vga_input" "$vga_output" >> "$log" 2>&1; then
-  printf 'selftest: VGA mode 13h input converted unexpectedly\n' >&2
+if ! "$converter" --verbose "$vga_input" "$vga_output" >> "$log" 2>&1; then
   cat "$log" >&2
   exit 1
 fi
 
-if ! grep -q 'VGA/non-CGA-EGA-MDA video mode 13h' "$log"; then
-  printf 'selftest: VGA rejection diagnostic missing\n' >&2
+if ! "$converter" --verbose "$ega_query_input" "$ega_query_output" >> "$log" 2>&1; then
   cat "$log" >&2
   exit 1
 fi
 
-if "$converter" --verbose "$vga_sig_input" "$vga_sig_output" >> "$log" 2>&1; then
-  printf 'selftest: VGA resource signature input converted unexpectedly\n' >&2
+if ! "$converter" --verbose "$svga_probe_input" "$svga_probe_output" >> "$log" 2>&1; then
   cat "$log" >&2
   exit 1
 fi
 
-if ! grep -q 'input appears to be a VGA application' "$log"; then
-  printf 'selftest: VGA resource signature diagnostic missing\n' >&2
+if ! "$converter" --verbose "$display_combo_input" "$display_combo_output" >> "$log" 2>&1; then
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! grep -q 'direct-video=1' "$log"; then
+  printf 'selftest: graphics video conversion did not claim direct-video output\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! od -v -An -tx1 "$vga_output" | tr -d ' \n' | grep -q 'b400cd10'; then
+  printf 'selftest: VGA mode stub did not restore AH=00h\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+ega_query_hex=$(od -v -An -tx1 "$ega_query_output" | tr -d ' \n')
+if ! printf '%s' "$ega_query_hex" | grep -q 'b310e8....90.*f8c3'; then
+  printf 'selftest: EGA alternate-select probe did not get conservative success stub\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! od -v -An -tx1 "$svga_probe_output" | tr -d ' \n' | grep -q '31c031c931d2f8c3'; then
+  printf 'selftest: enhanced video info probe did not return conservative zero result\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! od -v -An -tx1 "$display_combo_output" | tr -d ' \n' | grep -q '31c031dbf8c3'; then
+  printf 'selftest: display-combination probe did not return conservative no-VGA result\n' >&2
   cat "$log" >&2
   exit 1
 fi
@@ -143,6 +176,16 @@ if ! od -v -An -tx1 "$video_output" | tr -d ' \n' | grep -q 'b400cd10'; then
   cat "$log" >&2
   exit 1
 fi
+
+video_hex=$(od -v -An -tx1 "$video_output" | tr -d ' \n')
+for sig in 3c0472 b90144 b90344 b90244 b90444; do
+  if ! printf '%s' "$video_hex" | grep -q "$sig"; then
+    printf 'selftest: BIOS graphics console-lock signature %s missing\n' \
+           "$sig" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+done
 
 if ! od -v -An -tx1 "$video_output" | tr -d ' \n' | grep -q 'b40bcd10'; then
   printf 'selftest: BIOS palette stub did not restore AH=0Bh\n' >&2

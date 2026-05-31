@@ -838,7 +838,7 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
                       unsigned target_seg, uint16_t target_off,
                       int install_int21, uint16_t int21_handler,
                       const struct runtime_info *rt,
-                      int raw_keyboard, int install_int16,
+                      int raw_keyboard, int direct_video, int install_int16,
                       uint16_t int16_handler,
                       uint16_t psp_top_para)
 {
@@ -895,6 +895,7 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
   vec_append (&seg->bytes, prefix, sizeof (prefix));
   if (raw_keyboard)
     emit_stdin_raw_mode (&seg->bytes, rt);
+  (void) direct_video;
   if (seg->bytes.len + 5u > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
 
@@ -1008,6 +1009,19 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
                                                   code_base + h->ip);
   if (runtime_in_code)
     {
+      enum
+      {
+        /*
+         * Single-segment MZ programs often set DS and SS to CS and use
+         * the PSP "top of memory" word to choose a private stack/heap
+         * ceiling.  The converter appends runtime state and interrupt
+         * stubs above that ceiling, so leave a full 8 KiB tail for those
+         * generated helpers.  This keeps the NE segment comfortably below
+         * the 64 KiB loader edge while still advertising a DOS-like
+         * contiguous memory area below the runtime.
+         */
+        MZ_CODE_RUNTIME_TAIL = 8192u
+      };
       struct ne_seg_image *seg = &img->ne_seg[0];
       uint32_t reserve = 0;
       uint32_t max_reserve = 0;
@@ -1015,8 +1029,8 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
       if (seg->bytes.len < ELKS_MAX16)
         {
           max_reserve = ELKS_MAX16 - (uint32_t) seg->bytes.len;
-          if (max_reserve > 4096u)
-            max_reserve -= 4096u;
+          if (max_reserve > MZ_CODE_RUNTIME_TAIL)
+            max_reserve -= MZ_CODE_RUNTIME_TAIL;
           else
             max_reserve = 0;
         }
@@ -1130,6 +1144,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
                             stats->dynamic_int21, int21_handler,
                             &rt,
                             stats->bios_keyboard_input,
+                            stats->direct_video_output,
                             stats->dynamic_int16, int16_handler,
                             psp_top_para);
     }
@@ -1137,8 +1152,8 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
     append_ne_mz_startup (img, 0, (unsigned) entry_seg,
                           ne_local_offset (&img->ne_seg[entry_seg],
                                            code_base + h->ip),
-                          0, 0, &rt, stats->bios_keyboard_input, 0, 0,
-                          psp_top_para);
+                          0, 0, &rt, stats->bios_keyboard_input,
+                          stats->direct_video_output, 0, 0, psp_top_para);
   if (img->ne_seg[0].bytes.len > ELKS_MAX16)
     die ("NE startup segment grew beyond 64 KiB");
   img->ne_seg[0].mz_len = (uint32_t) img->ne_seg[0].bytes.len;
@@ -1294,11 +1309,13 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
       append_mz_argv_startup (img, h.ip, stats->dynamic_int21, int21_handler,
                               &rt,
                               stats->bios_keyboard_input,
+                              stats->direct_video_output,
                               stats->dynamic_int16, int16_handler);
     }
   else
     append_mz_argv_startup (img, h.ip, 0, 0, &rt,
-                            stats->bios_keyboard_input, 0, 0);
+                            stats->bios_keyboard_input,
+                            stats->direct_video_output, 0, 0);
 
   if (opts->verbose)
     fprintf (stderr,
