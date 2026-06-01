@@ -390,10 +390,14 @@ emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
   size_t ja_pos;
   size_t fail_pos;
   size_t sys_fail_pos;
+  size_t retry_pos;
+  size_t accept_pos;
+  size_t low_retry_pos;
 
   emit8 (v, 0x53);          /* push bx */
   emit8 (v, 0x51);          /* push cx */
   emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x36);
   emit8 (v, 0x8b);
   emit8 (v, 0x16);
   emit16 (v, rt->heap_base_seg_off);
@@ -403,9 +407,11 @@ emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0x74);          /* je fmemalloc */
   fmem_pos = v->len;
   emit8 (v, 0);
+  emit8 (v, 0x36);
   emit8 (v, 0x8b);
   emit8 (v, 0x0e);
   emit16 (v, rt->heap_next_off);
+  emit8 (v, 0x36);
   emit8 (v, 0x8b);
   emit8 (v, 0x16);
   emit16 (v, rt->heap_limit_off);
@@ -422,9 +428,11 @@ emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0xc8);          /* ax = relative allocation paragraph */
   emit8 (v, 0x01);
   emit8 (v, 0xd9);          /* cx += bx */
+  emit8 (v, 0x36);
   emit8 (v, 0x89);
   emit8 (v, 0x0e);
   emit16 (v, rt->heap_next_off);
+  emit8 (v, 0x36);
   emit8 (v, 0x8b);
   emit8 (v, 0x16);
   emit16 (v, rt->heap_base_seg_off);
@@ -433,7 +441,7 @@ emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0x75);
   emit8 (v, 0x02);          /* jnz have_base */
   emit8 (v, 0x8c);
-  emit8 (v, 0xda);          /* dx = ds */
+  emit8 (v, 0xd2);          /* dx = ss */
   emit8 (v, 0x01);
   emit8 (v, 0xd0);          /* ax += allocation base segment */
   emit8 (v, 0x5a);
@@ -462,35 +470,58 @@ emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0x74);          /* je query_largest */
   query_pos = v->len;
   emit8 (v, 0);
+  emit8 (v, 0x36);
   emit8 (v, 0x3b);
   emit8 (v, 0x1e);
   emit16 (v, rt->heap_limit_off);       /* cmp bx, largest advertised */
   emit8 (v, 0x77);                      /* ja overlarge_probe */
   overlarge_pos = v->len;
   emit8 (v, 0);
+
+  retry_pos = v->len;
+  emit8 (v, 0x36);
   emit8 (v, 0xc7);
   emit8 (v, 0x06);
   emit16 (v, rt->heap_next_off);
   emit16 (v, 0);            /* clear output segment word */
+  emit8 (v, 0x1e);          /* fmemalloc writes through DS:CX */
+  emit8 (v, 0x16);
+  emit8 (v, 0x1f);          /* ds = ss for runtime state */
   emit8 (v, 0xb9);
   emit16 (v, rt->heap_next_off);
   emit8 (v, 0xb8);
   emit16 (v, 82);           /* fmemalloc */
   emit8 (v, 0xcd);
   emit8 (v, 0x80);
+  emit8 (v, 0x1f);          /* restore caller ds */
   emit8 (v, 0x85);
   emit8 (v, 0xc0);          /* test ax, ax */
   emit8 (v, 0x78);          /* js sys_fail */
   sys_fail_pos = v->len;
   emit8 (v, 0);
+  emit8 (v, 0x36);
   emit8 (v, 0xa1);
   emit16 (v, rt->heap_next_off);        /* ax = allocated segment */
+  emit8 (v, 0x8c);
+  emit8 (v, 0xd2);          /* dx = ss; DOS blocks should follow program */
+  emit8 (v, 0x39);
+  emit8 (v, 0xd0);          /* cmp ax, dx */
+  emit8 (v, 0x73);          /* jae accept */
+  accept_pos = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xeb);          /* retry, leaking low setup blocks until exit */
+  low_retry_pos = v->len;
+  emit8 (v, 0);
+  v->data[accept_pos] = (uint8_t) (v->len - (accept_pos + 1u));
+  v->data[low_retry_pos] =
+    (uint8_t) (retry_pos - (low_retry_pos + 1u));
   emit8 (v, 0x5a);
   emit8 (v, 0x59);
   emit8 (v, 0x5b);
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
   v->data[sys_fail_pos] = (uint8_t) (v->len - (sys_fail_pos + 1u));
+  emit8 (v, 0x36);
   emit8 (v, 0x8b);
   emit8 (v, 0x1e);
   emit16 (v, rt->heap_limit_off);
@@ -505,15 +536,22 @@ emit_alloc_stub (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0xc3);
 
   v->data[overlarge_pos] = (uint8_t) (v->len - (overlarge_pos + 1u));
+  emit8 (v, 0x36);
+  emit8 (v, 0x8b);
+  emit8 (v, 0x1e);
+  emit16 (v, rt->heap_limit_off);
   emit8 (v, 0xb8);
-  emit16 (v, 0x1000u);      /* transient probe segment, not a real arena */
+  emit16 (v, 8);            /* insufficient memory */
   emit8 (v, 0x5a);
   emit8 (v, 0x59);
-  emit8 (v, 0x5b);
-  emit8 (v, 0xf8);
+  emit8 (v, 0x83);
+  emit8 (v, 0xc4);
+  emit8 (v, 0x02);          /* discard saved bx */
+  emit8 (v, 0xf9);
   emit8 (v, 0xc3);
 
   v->data[query_pos] = (uint8_t) (v->len - (query_pos + 1u));
+  emit8 (v, 0x36);
   emit8 (v, 0x8b);
   emit8 (v, 0x1e);
   emit16 (v, rt->heap_limit_off);
@@ -537,6 +575,7 @@ emit_free_stub (struct byte_vec *v, const struct runtime_info *rt)
 
   emit8 (v, 0x53);          /* push bx */
   emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0x36);
   emit8 (v, 0x8b);
   emit8 (v, 0x16);
   emit16 (v, rt->heap_base_seg_off);

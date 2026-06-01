@@ -328,8 +328,10 @@ mz_entry_loads_ds_from_cs (const uint8_t *image, size_t image_len,
       if (op == 0x0e && image[pos + 1u] == 0x1f)
         return 1;           /* push cs; pop ds */
 
-      if ((op == 0xe8 || op == 0xe9 || op == 0xea || op == 0xcd
-           || op == 0xc2 || op == 0xc3 || op == 0xca || op == 0xcb))
+      if ((op >= 0x70 && op <= 0x7fu) || op == 0xeb
+          || (op >= 0xe0 && op <= 0xe3)
+          || op == 0xe8 || op == 0xe9 || op == 0xea || op == 0xcd
+          || op == 0xc2 || op == 0xc3 || op == 0xca || op == 0xcb)
         return 0;
 
       if ((op == 0x8c || op == 0x8e) && pos + 1u < end)
@@ -865,7 +867,9 @@ static unsigned
 ne_add_env_segment (struct image *img)
 {
   uint8_t env[64];
+  static const uint8_t path_env[] = "PATH=.";
   static const uint8_t argv0[] = "C:\\PROGRAM.EXE";
+  size_t pos;
 
   /*
    * DOS stores a segment pointer to the process environment at PSP:002Ch.
@@ -875,8 +879,13 @@ ne_add_env_segment (struct image *img)
    * it is missing.
    */
   memset (env, 0, sizeof (env));
-  env[2] = 1;
-  memcpy (env + 4u, argv0, sizeof (argv0));
+  pos = 0;
+  memcpy (env + pos, path_env, sizeof (path_env));
+  pos += sizeof (path_env);
+  env[pos++] = 0;
+  env[pos++] = 1;
+  env[pos++] = 0;
+  memcpy (env + pos, argv0, sizeof (argv0));
   return ne_add_segment (img, 0x111000u, env, sizeof (env), NESEG_DATA);
 }
 
@@ -1013,6 +1022,8 @@ ne_enable_conventional_dos_heap (struct image *img, unsigned runtime_seg,
   uint16_t largest;
 
   largest = max_request;
+  if (largest < 0x7fffu)
+    largest = 0x7fffu;
 
   /*
    * Some DOS games allocate a conventional-memory arena far larger than one
@@ -1030,22 +1041,20 @@ static void
 ne_enable_far_dos_heap (struct image *img, unsigned runtime_seg,
                         struct runtime_info *rt)
 {
-  static const uint8_t zero = 0;
-  unsigned heap_seg;
   struct ne_seg_image *seg;
 
-  if (img->ne_nsegs >= NE_MAX_SEGS)
-    return;
-
-  heap_seg = ne_add_segment (img, 0x100000u, &zero, 1u, NESEG_DATA);
-  img->ne_seg[heap_seg].min_alloc = 0xfff0u;
-
+  /*
+   * DOS AH=48h returns a segment that programs may immediately load into DS
+   * and dereference.  ELKS validates user segment bases, so returning an
+   * arbitrary paragraph inside the auto-data segment is not enough.  Use
+   * kernel-owned far-memory blocks for dynamic DOS allocations; each returned
+   * paragraph is then an actual user segment base and can safely be used like
+   * a real DOS allocation block.
+   */
   seg = &img->ne_seg[runtime_seg];
   put16 (seg->bytes.data + rt->heap_next_off, 0);
-  put16 (seg->bytes.data + rt->heap_limit_off, 0x0fffu);
-  ne_reloc_add (&seg->rels, rt->heap_base_seg_off, NEFIXSRC_SEGMENT,
-                NEFIXFLG_INTERNAL, (uint8_t) (heap_seg + 1u), 0);
-  seg->flags |= NESEG_RELOCINFO;
+  put16 (seg->bytes.data + rt->heap_limit_off, 0x7fffu);
+  put16 (seg->bytes.data + rt->heap_base_seg_off, 0xffffu);
 }
 
 static void
