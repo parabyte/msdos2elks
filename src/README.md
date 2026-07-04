@@ -15,6 +15,7 @@ output.c         ELKS Minix a.out and OS/2 NE writers.
 main.c           Command entry point.
 ```
 
-The top-level `msdos2elks.c` includes these files into one translation unit.
-This keeps the small binary patch helpers private to the converter while making
-each subsystem easier to read and edit.
+The Makefile builds each `.c` file as a separate object and links the
+host-side converter from those objects.  Shared internal functions are declared
+in `internal.h`; subsystem-local scanners and emitters stay `static` inside
+their source files.

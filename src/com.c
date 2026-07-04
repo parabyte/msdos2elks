@@ -1,7 +1,38 @@
 #include "internal.h"
 
-convert_com (const uint8_t *input, size_t input_len, const struct options *opts,
-             struct image *img, struct patch_stats *stats)
+static int
+com_has_ascii (const uint8_t *p, size_t len, const char *needle)
+{
+  size_t n = strlen (needle);
+  size_t i;
+
+  if (n == 0 || n > len)
+    return 0;
+  for (i = 0; i + n <= len; i++)
+    if (memcmp (p + i, needle, n) == 0)
+      return 1;
+  return 0;
+}
+
+static void
+reject_known_com_packers (const uint8_t *input, size_t input_len)
+{
+  /*
+   * A packed COM file still starts at offset 0100h, but that entry belongs to
+   * the unpacking stub rather than to the DOS program the converter needs to
+   * inspect.  Do not try to run or reveal that loader.  Reject obvious packer
+   * signatures and require a plain XT-era COM image as input.
+   */
+  if (com_has_ascii (input, input_len, "UPX!"))
+    die ("COM executable appears to be UPX packed; provide a plain DOS executable");
+  if (com_has_ascii (input, input_len, "PKLITE"))
+    die ("COM executable appears to be PKLITE packed; provide a plain DOS executable");
+}
+
+void
+convert_com (const uint8_t *input, size_t input_len,
+             const struct options *opts, struct image *img,
+             struct patch_stats *stats)
 {
   struct runtime_info rt;
   uint32_t low_mem;
@@ -11,6 +42,7 @@ convert_com (const uint8_t *input, size_t input_len, const struct options *opts,
 
   if (input_len + COM_ORG > ELKS_MAX16)
     die ("COM image is too large for an ELKS 16-bit segment");
+  reject_known_com_packers (input, input_len);
 
   init_image_memory (img, opts);
   img->entry = COM_ORG;
@@ -58,12 +90,16 @@ convert_com (const uint8_t *input, size_t input_len, const struct options *opts,
                                &rt,
                                stats->bios_keyboard_input,
                                stats->direct_video_output,
-                               stats->dynamic_int16, int16_handler);
+                               stats->dynamic_int16, int16_handler,
+                               opts->startup_video_mode_set,
+                               opts->startup_video_mode);
     }
   else
     {
       install_com_return_exit (img, &rt);
       append_com_argv_startup (img, 0, 0, &rt, stats->bios_keyboard_input,
-                               stats->direct_video_output, 0, 0);
+                               stats->direct_video_output, 0, 0,
+                               opts->startup_video_mode_set,
+                               opts->startup_video_mode);
     }
 }

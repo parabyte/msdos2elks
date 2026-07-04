@@ -691,7 +691,7 @@ emit_restore_text_mode_if_needed (struct byte_vec *v,
   patch_rel8 (v, already_mda_rel, done);
 }
 
-static void
+void
 emit_save_initial_video_mode (struct byte_vec *v,
                               const struct runtime_info *rt)
 {
@@ -787,7 +787,7 @@ emit_release_console_video (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0x58);          /* pop ax */
 }
 
-static void
+void
 emit_exit_stub (struct byte_vec *v, int use_al,
                 const struct runtime_info *rt)
 {
@@ -1858,8 +1858,6 @@ emit_enable_console_raw_scancodes (struct byte_vec *v,
   };
   size_t mode_ready_rel;
   size_t no_fd_rel;
-  size_t text_mode_rel;
-  size_t mda_mode_rel;
   size_t dcget_fail_rel;
   size_t dcset_fail_rel;
   size_t done;
@@ -1883,21 +1881,6 @@ emit_enable_console_raw_scancodes (struct byte_vec *v,
   emit16 (v, 0xffffu);      /* keyboard was not opened at startup */
   emit8 (v, 0x74);
   no_fd_rel = v->len;
-  emit8 (v, 0);
-
-  emit8 (v, 0xa0);
-  emit16 (v, rt->video_mode_off);
-  emit8 (v, 0x24);
-  emit8 (v, 0x7f);
-  emit8 (v, 0x3c);
-  emit8 (v, 0x04);          /* BIOS modes 00h-03h are text modes */
-  emit8 (v, 0x72);
-  text_mode_rel = v->len;
-  emit8 (v, 0);
-  emit8 (v, 0x3c);
-  emit8 (v, 0x07);          /* MDA text mode */
-  emit8 (v, 0x74);
-  mda_mode_rel = v->len;
   emit8 (v, 0);
 
   emit8 (v, 0x8b);
@@ -1942,14 +1925,28 @@ emit_enable_console_raw_scancodes (struct byte_vec *v,
   done = v->len;
   patch_rel8 (v, mode_ready_rel, done);
   patch_rel8 (v, no_fd_rel, done);
-  patch_rel8 (v, text_mode_rel, done);
-  patch_rel8 (v, mda_mode_rel, done);
   patch_rel8 (v, dcget_fail_rel, done);
   patch_rel8 (v, dcset_fail_rel, done);
   emit8 (v, 0x5a);          /* pop dx */
   emit8 (v, 0x59);          /* pop cx */
   emit8 (v, 0x5b);          /* pop bx */
   emit8 (v, 0x58);          /* pop ax */
+}
+
+void
+emit_claim_console_video (struct byte_vec *v, const struct runtime_info *rt)
+{
+  /*
+   * DOS programs that use BIOS video services or direct B800h/B000h/A000h
+   * memory need the ELKS console to stop repainting over their screen.  This
+   * is true for text-mode games as well as CGA graphics games: many XT-era
+   * titles draw colored character cells directly in 80x25 text mode.
+   *
+   * The helper preserves the caller registers and uses only 8088/8086
+   * instructions.  It does not change the BIOS video mode; it only asks ELKS
+   * for direct console ownership and raw keyboard scancodes.
+   */
+  emit_enable_console_raw_scancodes (v, rt);
 }
 
 static void
@@ -1964,6 +1961,40 @@ emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt
   emit8 (v, 0x10);                 /* let BIOS switch real hardware */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
+}
+
+void
+emit_startup_video_mode (struct byte_vec *v,
+                         const struct runtime_info *rt, uint8_t mode)
+{
+  /*
+   * Some XT-era games draw directly into the CGA display aperture and never
+   * make a statically visible INT 10h AH=00h mode call after the converter's
+   * startup wrapper.  This optional startup hook lets smoke tests select a
+   * known BIOS mode first while still saving the original ELKS text mode for
+   * the normal exit restore path.
+   *
+   * The generated code uses only 8088/8086 instructions.  MODE is an 8-bit BIOS
+   * video mode number; no arithmetic is performed, so there is no rounding,
+   * scaling, saturation, or overflow behavior at this interface.
+   */
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0xb0);
+  emit8 (v, mode);          /* al = requested BIOS mode */
+  emit8 (v, 0xa2);
+  emit16 (v, rt->video_mode_off);
+  emit_enable_console_raw_scancodes (v, rt);
+  emit8 (v, 0xb8);
+  emit16 (v, (uint16_t) mode);     /* ax = 0000h:mode */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x10);                 /* let BIOS switch real hardware */
+  emit8 (v, 0x5a);          /* pop dx */
+  emit8 (v, 0x59);          /* pop cx */
+  emit8 (v, 0x5b);          /* pop bx */
+  emit8 (v, 0x58);          /* pop ax */
 }
 
 static void
@@ -2131,7 +2162,85 @@ emit_bios_video_stub_for_fn (struct byte_vec *v, uint8_t fn,
     }
 }
 
-static int
+uint16_t
+emit_bios_dynamic_video_stub (struct byte_vec *v,
+                              const struct runtime_info *rt)
+{
+  static const uint8_t special_fns[] = {
+    0x00,                   /* set video mode */
+    0x12,                   /* EGA alternate select/query */
+    0x1a,                   /* display combination code */
+    0x30                    /* enhanced adapter information */
+  };
+  struct fixup
+  {
+    size_t call_rel;
+    size_t finish_rel;
+  };
+  struct fixup fixups[sizeof (special_fns) / sizeof (special_fns[0])];
+  size_t start = v->len;
+  size_t finish;
+  size_t i;
+
+  /*
+   * Many DOS libraries route all BIOS video calls through a helper with AH
+   * already loaded by the caller.  This dynamic adapter keeps that DOS surface
+   * general: known hardware-probe functions use the converter's conservative
+   * XT-compatible stubs, mode set claims the ELKS console before calling the
+   * ROM BIOS, and all other functions pass through to the real BIOS with AH
+   * unchanged.  Only 8088/8086 instructions are emitted.
+   */
+  if (start > ELKS_MAX16)
+    die ("text segment grew beyond 64 KiB while adding int 10h adapter");
+
+  emit8 (v, 0x55);          /* push bp */
+  emit8 (v, 0x56);          /* push si */
+  emit8 (v, 0x57);          /* push di */
+
+  for (i = 0; i < sizeof (special_fns) / sizeof (special_fns[0]); i++)
+    {
+      emit8 (v, 0x80);
+      emit8 (v, 0xfc);
+      emit8 (v, special_fns[i]);        /* cmp ah, imm8 */
+      emit8 (v, 0x75);
+      emit8 (v, 0x06);       /* jne over call+jmp */
+      emit8 (v, 0xe8);       /* call selected BIOS video adapter */
+      fixups[i].call_rel = v->len;
+      emit16 (v, 0);
+      emit8 (v, 0xe9);       /* jmp finish */
+      fixups[i].finish_rel = v->len;
+      emit16 (v, 0);
+    }
+
+  emit8 (v, 0xcd);
+  emit8 (v, 0x10);          /* pass through unhandled video functions */
+
+  finish = v->len;
+  emit8 (v, 0x5f);          /* pop di */
+  emit8 (v, 0x5e);          /* pop si */
+  emit8 (v, 0x5d);          /* pop bp */
+  emit8 (v, 0xc3);          /* ret to the DOS caller */
+
+  for (i = 0; i < sizeof (special_fns) / sizeof (special_fns[0]); i++)
+    {
+      size_t stub = v->len;
+      uint16_t rel;
+
+      if (!emit_bios_video_stub_for_fn (v, special_fns[i], rt))
+        die ("internal int 10h adapter dispatch table mismatch");
+      if (stub > ELKS_MAX16 || v->len > ELKS_MAX16)
+        die ("text segment grew beyond 64 KiB while adding int 10h adapter");
+
+      rel = (uint16_t) (stub - (fixups[i].call_rel + 2u));
+      put16 (v->data + fixups[i].call_rel, rel);
+      rel = (uint16_t) (finish - (fixups[i].finish_rel + 2u));
+      put16 (v->data + fixups[i].finish_rel, rel);
+    }
+
+  return (uint16_t) start;
+}
+
+int
 emit_bios_keyboard_stub_for_fn (struct byte_vec *v, uint8_t fn,
                                 const struct runtime_info *rt)
 {
@@ -2313,8 +2422,8 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
     case 0x0d:
       emit_success_stub (v);
       return 1;
-    case 0x0f:              /* FCB open: fail closed, no native handle */
-      emit_al_status_stub (v, 0xff);
+    case 0x0f:              /* FCB open: no native handle, but allow probes */
+      emit_al_status_stub (v, 0);
       return 1;
     case 0x10:              /* FCB close: no-op success */
       emit_al_status_stub (v, 0);
@@ -2328,7 +2437,17 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       emit_al_status_stub (v, 1);       /* EOF */
       return 1;
     case 0x15:              /* FCB sequential write */
-      emit_al_status_stub (v, 1);
+    case 0x16:              /* FCB create: no-op success */
+      /*
+       * Several XT-era games use DOS FCB calls only for high-score or
+       * configuration files.  ELKS does not provide a native FCB object, and
+       * translating a full FCB into a kernel file descriptor would require a
+       * handle table in the tiny generated runtime.  For this compatibility
+       * layer, reads still report EOF, but create/write/close/open report
+       * success so games do not stop at a non-critical "cannot save" screen.
+       * No data is persisted by these FCB stubs.
+       */
+      emit_al_status_stub (v, 0);
       return 1;
     case 0x0b:
       emit_dos_key_status_stub (v, rt);
@@ -2351,12 +2470,14 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       return 1;
     case 0x22:              /* FCB random write */
     case 0x23:              /* FCB get file size */
-      emit_al_status_stub (v, 0xff);
+      emit_al_status_stub (v, 0);
       return 1;
     case 0x27:              /* FCB random block read */
       emit_al_status_stub (v, 1);
       return 1;
     case 0x28:              /* FCB random block write */
+      emit_al_status_stub (v, 0);
+      return 1;
     case 0x29:              /* parse filename into FCB */
       emit_al_status_stub (v, 0xff);
       return 1;
@@ -2478,6 +2599,48 @@ emit_mouse_stub_for_fn (struct byte_vec *v, uint8_t fn)
 }
 
 static int
+emit_bios_service_stub_for_fn (struct byte_vec *v, uint8_t fn)
+{
+  switch (fn)
+    {
+    case 0xc0:              /* get system configuration */
+      /*
+       * INT 15h AH=C0h is an AT-era BIOS query.  On an XT-class target the
+       * conservative result is carry set, meaning the configuration table is
+       * unavailable.  Programs that use this only to distinguish plain PC/XT
+       * hardware can then fall back to the oldest display and keyboard path.
+       */
+      emit_fail_stub (v);
+      return 1;
+    default:
+      return 0;
+    }
+}
+
+static int
+emit_bios_printer_stub_for_fn (struct byte_vec *v, uint8_t fn)
+{
+  switch (fn)
+    {
+    case 0x00:              /* print character */
+    case 0x01:              /* initialize printer */
+    case 0x02:              /* get printer status */
+      /*
+       * XT-era programs often include printer helper code even when gameplay
+       * never uses it.  Report the printer as timed out/unavailable.  BIOS
+       * printer status is returned in AH; bit 0 is the timeout condition.
+       */
+      emit8 (v, 0xb4);
+      emit8 (v, 0x01);      /* AH = timeout */
+      emit8 (v, 0xf9);      /* CF set for callers that also check carry */
+      emit8 (v, 0xc3);
+      return 1;
+    default:
+      return 0;
+    }
+}
+
+int
 emit_stub_for_interrupt (struct byte_vec *v, uint8_t intr, uint8_t fn,
                          const struct runtime_info *rt)
 {
@@ -2485,8 +2648,12 @@ emit_stub_for_interrupt (struct byte_vec *v, uint8_t intr, uint8_t fn,
     {
     case 0x10:
       return emit_bios_video_stub_for_fn (v, fn, rt);
+    case 0x15:
+      return emit_bios_service_stub_for_fn (v, fn);
     case 0x16:
       return emit_bios_keyboard_stub_for_fn (v, fn, rt);
+    case 0x17:
+      return emit_bios_printer_stub_for_fn (v, fn);
     case 0x1a:
       return emit_bios_clock_stub_for_fn (v, fn);
     case 0x21:
@@ -2498,7 +2665,7 @@ emit_stub_for_interrupt (struct byte_vec *v, uint8_t intr, uint8_t fn,
     }
 }
 
-static void
+void
 emit_install_int21_vector (struct byte_vec *v, uint16_t handler_off)
 {
   emit8 (v, 0x1e);          /* push ds */
@@ -2521,7 +2688,7 @@ emit_install_int21_vector (struct byte_vec *v, uint16_t handler_off)
   emit8 (v, 0x1f);          /* pop ds */
 }
 
-static void
+void
 emit_stdin_raw_mode (struct byte_vec *v, const struct runtime_info *rt)
 {
   enum
@@ -2566,9 +2733,9 @@ emit_stdin_raw_mode (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0x80);
   emit8 (v, 0x85);
   emit8 (v, 0xc0);          /* test ax, ax */
-  emit8 (v, 0x90);
-  emit8 (v, 0x90);          /* prefer the active console device */
-  stdin_ok_rel = SIZE_MAX;
+  emit8 (v, 0x74);          /* prefer the active console device */
+  stdin_ok_rel = v->len;
+  emit8 (v, 0);
 
   emit8 (v, 0xc7);
   emit8 (v, 0x04);
@@ -2685,7 +2852,7 @@ emit_stdin_raw_mode (struct byte_vec *v, const struct runtime_info *rt)
   emit8 (v, 0x58);          /* pop ax */
 }
 
-static void
+void
 emit_install_int16_vector (struct byte_vec *v, uint16_t handler_off)
 {
   emit8 (v, 0x1e);          /* push ds */
@@ -2708,14 +2875,15 @@ emit_install_int16_vector (struct byte_vec *v, uint16_t handler_off)
   emit8 (v, 0x1f);          /* pop ds */
 }
 
-static uint16_t
+uint16_t
 append_int21_interrupt_handler (struct byte_vec *text,
                                 const struct runtime_info *rt)
 {
   static const uint8_t fns[] = {
     0x00, 0x01, 0x02, 0x06, 0x07, 0x08, 0x09, 0x0b,
     0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
-    0x15, 0x19, 0x1a, 0x1b, 0x1c, 0x21, 0x22, 0x23,
+    0x15, 0x16, 0x19, 0x1a, 0x1b, 0x1c, 0x21, 0x22,
+    0x23,
     0x25, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
     0x2e, 0x2f, 0x30, 0x33, 0x35, 0x36, 0x39, 0x3a,
     0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42,
@@ -2802,7 +2970,7 @@ append_int21_interrupt_handler (struct byte_vec *text,
   return (uint16_t) start;
 }
 
-static uint16_t
+uint16_t
 append_int16_interrupt_handler (struct byte_vec *text,
                                 const struct runtime_info *rt)
 {

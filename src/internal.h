@@ -6,16 +6,14 @@
  *
  * The converter is deliberately a static binary rewriter rather than a DOS
  * emulator or a wrapper.  It parses COM and MZ images, removes the DOS load
- * format, emits ELKS Minix a.out for COM inputs, and emits OS/2 1.x NE by
- * default for MZ inputs so DOS EXE segment layout can be preserved for ELKS
- * builds with CONFIG_EXEC_OS2 enabled.  A flat MZ-to-a.out path remains
- * available for users who explicitly request it.
+ * format, emits ELKS Minix a.out for COM inputs and flat-compatible MZ inputs,
+ * and keeps OS/2 1.x NE output as an explicit or automatic fallback when a
+ * segmented EXE cannot be represented in one native ELKS text/data window.
  *
  * Conversion happens in conservative phases:
  *
- *   1. identify the input shape, reveal supported packed MZ images, and
- *      reject packed images that must still be unpacked before the real
- *      program can be inspected;
+ *   1. identify the input shape and reject packed images whose entry bytes
+ *      still belong to a loader stub instead of the real program;
  *   2. construct ELKS text/data layout, relocation records, startup code, PSP
  *      compatible command-tail state, and DOS-style memory scratch space;
  *   3. replace statically proven DOS/BIOS I/O interrupt sites with near calls
@@ -26,7 +24,9 @@
  *
  * The comments in the implementation focus on boundary decisions and binary
  * layout details, since those are the parts future maintainers most need to
- * audit when adding a new interrupt adapter or executable shape.
+ * audit when adding a new interrupt adapter or executable shape.  This tree
+ * intentionally contains no compression or decompression support; packed DOS
+ * programs must be made plain before they reach the converter.
  */
 
 #include <errno.h>
@@ -127,11 +127,13 @@ struct options
   int bss_set;
   int mz_code_set;
   int mz_data_set;
+  int startup_video_mode_set;
   uint16_t stack;
   uint16_t heap;
   uint16_t bss;
   uint16_t mz_code_seg;
   uint16_t mz_data_seg;
+  uint8_t startup_video_mode;
   const char *input;
   const char *output;
 };
@@ -165,6 +167,7 @@ struct patch_stats
 {
   unsigned patched;
   unsigned unsupported;
+  int dynamic_int10;
   int dynamic_int21;
   int dynamic_int16;
   int bios_keyboard_input;
@@ -229,7 +232,91 @@ struct mz_imm_store
   int32_t disp;
 };
 
-static int pklite_reveal_mz (const uint8_t *input, size_t input_len,
-                             uint8_t **out, size_t *out_len, int verbose);
+void die (const char *msg) __attribute__ ((noreturn));
+void die_errno (const char *path) __attribute__ ((noreturn));
+
+uint16_t get16 (const uint8_t *p);
+void put16 (uint8_t *p, uint16_t v);
+void vec_append (struct byte_vec *v, const uint8_t *data, size_t len);
+void vec_append_zeros (struct byte_vec *v, size_t len);
+void emit8 (struct byte_vec *v, uint8_t b);
+void emit16 (struct byte_vec *v, uint16_t w);
+void emit32 (struct byte_vec *v, uint32_t l);
+int bios_video_mode_needs_console_lock (uint8_t mode);
+void reloc_add (struct reloc_vec *v, uint32_t addr, uint16_t sym);
+void ne_reloc_add (struct ne_reloc_vec *v, uint16_t src_chain,
+                   uint8_t src_type, uint8_t flags, uint8_t segment,
+                   uint16_t offset);
+
+void parse_options (int argc, char **argv, struct options *opts);
+uint8_t *read_file (const char *path, size_t *len_out);
+
+void convert_com (const uint8_t *input, size_t input_len,
+                  const struct options *opts, struct image *img,
+                  struct patch_stats *stats);
+void convert_mz (const uint8_t *input, size_t input_len,
+                 const struct options *opts, struct image *img,
+                 struct patch_stats *stats);
+
+void write_elks (const char *path, const struct image *img);
+void free_image (struct image *img);
+
+void report_unsupported (const struct patch_stats *stats);
+void patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
+                   const struct runtime_info *rt,
+                   const struct reloc_vec *text_rels);
+
+void patch_com_segment_setup (struct byte_vec *text,
+                              struct patch_stats *stats);
+void patch_mz_stack_setup (struct byte_vec *text,
+                           struct patch_stats *stats);
+void patch_dos_stack_switches (struct byte_vec *text,
+                               struct patch_stats *stats);
+void append_com_argv_startup (struct image *img, int install_int21,
+                              uint16_t int21_handler,
+                              const struct runtime_info *rt,
+                              int raw_keyboard, int direct_video,
+                              int install_int16, uint16_t int16_handler,
+                              int startup_video_mode_set,
+                              uint8_t startup_video_mode);
+void install_com_return_exit (struct image *img,
+                              const struct runtime_info *rt);
+void append_mz_argv_startup (struct image *img, uint16_t original_entry,
+                             int install_int21, uint16_t int21_handler,
+                             const struct runtime_info *rt,
+                             int raw_keyboard, int direct_video,
+                             int install_int16, uint16_t int16_handler,
+                             int startup_video_mode_set,
+                             uint8_t startup_video_mode);
+void init_image_memory (struct image *img, const struct options *opts);
+uint16_t align_para (uint32_t bytes);
+void append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
+                                   uint16_t stack, uint16_t bss,
+                                   struct runtime_info *rt);
+void append_runtime_state (struct image *img, struct runtime_info *rt);
+size_t scan_instruction_len (const uint8_t *p, size_t avail);
+
+void emit_install_int21_vector (struct byte_vec *v, uint16_t handler_off);
+void emit_install_int16_vector (struct byte_vec *v, uint16_t handler_off);
+void emit_save_initial_video_mode (struct byte_vec *v,
+                                   const struct runtime_info *rt);
+void emit_startup_video_mode (struct byte_vec *v,
+                              const struct runtime_info *rt, uint8_t mode);
+void emit_claim_console_video (struct byte_vec *v,
+                               const struct runtime_info *rt);
+void emit_stdin_raw_mode (struct byte_vec *v,
+                          const struct runtime_info *rt);
+void emit_exit_stub (struct byte_vec *v, int use_al,
+                     const struct runtime_info *rt);
+int emit_bios_keyboard_stub_for_fn (struct byte_vec *v, uint8_t fn,
+                                    const struct runtime_info *rt);
+uint16_t emit_bios_dynamic_video_stub (struct byte_vec *v,
+                                       const struct runtime_info *rt);
+int emit_stub_for_interrupt (struct byte_vec *v, uint8_t intr, uint8_t fn,
+                             const struct runtime_info *rt);
+uint16_t append_int21_interrupt_handler (struct byte_vec *text,
+                                         const struct runtime_info *rt);
+uint16_t append_int16_interrupt_handler (struct byte_vec *text,
+                                         const struct runtime_info *rt);
 
 #endif /* MSDOS2ELKS_INTERNAL_H */

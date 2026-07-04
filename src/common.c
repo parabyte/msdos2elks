@@ -1,26 +1,26 @@
 #include "internal.h"
 
-static void
+void
 die (const char *msg)
 {
   fprintf (stderr, "msdos2elks: %s\n", msg);
   exit (1);
 }
 
-static void
+void
 die_errno (const char *path)
 {
   fprintf (stderr, "msdos2elks: %s: %s\n", path, strerror (errno));
   exit (1);
 }
 
-static uint16_t
+uint16_t
 get16 (const uint8_t *p)
 {
   return (uint16_t) p[0] | ((uint16_t) p[1] << 8);
 }
 
-static void
+void
 put16 (uint8_t *p, uint16_t v)
 {
   p[0] = (uint8_t) v;
@@ -53,7 +53,7 @@ vec_reserve (struct byte_vec *v, size_t add)
   v->cap = ncap;
 }
 
-static void
+void
 vec_append (struct byte_vec *v, const uint8_t *data, size_t len)
 {
   vec_reserve (v, len);
@@ -61,7 +61,7 @@ vec_append (struct byte_vec *v, const uint8_t *data, size_t len)
   v->len += len;
 }
 
-static void
+void
 vec_append_zeros (struct byte_vec *v, size_t len)
 {
   vec_reserve (v, len);
@@ -69,21 +69,21 @@ vec_append_zeros (struct byte_vec *v, size_t len)
   v->len += len;
 }
 
-static void
+void
 emit8 (struct byte_vec *v, uint8_t b)
 {
   vec_reserve (v, 1u);
   v->data[v->len++] = b;
 }
 
-static void
+void
 emit16 (struct byte_vec *v, uint16_t w)
 {
   emit8 (v, (uint8_t) w);
   emit8 (v, (uint8_t) (w >> 8));
 }
 
-static void
+void
 emit32 (struct byte_vec *v, uint32_t l)
 {
   emit16 (v, (uint16_t) l);
@@ -97,7 +97,7 @@ bios_video_mode_is_text (uint8_t mode)
   return mode <= 0x03u || mode == 0x07u;
 }
 
-static int
+int
 bios_video_mode_needs_console_lock (uint8_t mode)
 {
   /*
@@ -112,7 +112,7 @@ bios_video_mode_needs_console_lock (uint8_t mode)
   return !bios_video_mode_is_text (mode);
 }
 
-static void
+void
 reloc_add (struct reloc_vec *v, uint32_t addr, uint16_t sym)
 {
   struct reloc_rec *p;
@@ -135,7 +135,7 @@ reloc_add (struct reloc_vec *v, uint32_t addr, uint16_t sym)
   v->len++;
 }
 
-static void
+void
 ne_reloc_add (struct ne_reloc_vec *v, uint16_t src_chain, uint8_t src_type,
               uint8_t flags, uint8_t segment, uint16_t offset)
 {

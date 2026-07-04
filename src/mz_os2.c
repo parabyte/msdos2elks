@@ -49,24 +49,21 @@ reject_known_mz_packers (const uint8_t *input, size_t input_len,
 
   if (has_ascii (input, scan_len, "LZ91")
       || has_ascii (input, scan_len, "LZ09"))
-    die ("MZ executable appears to be LZEXE packed; unpack it before conversion");
-
-  if (has_ascii (input, input_len, "PKLITE"))
-    die ("MZ executable appears to be PKLITE packed; unpack it before conversion");
+    die ("MZ executable appears to be LZEXE packed; provide a plain DOS executable");
 
   if (has_ascii (input, input_len, "PKWARE Data Compression Library"))
-    die ("MZ executable appears to be a compressed installer/SFX; extract it before conversion");
+    die ("MZ executable appears to be an installer/SFX; provide a plain DOS executable");
 
   if (entry + 4u <= image_len
       && image[entry] == 0x0e && image[entry + 1u] == 0x1f
       && image[entry + 2u] == 0x8b && image[entry + 3u] == 0x0e)
-    die ("MZ executable appears to be EXEPACK/LZ-style packed; unpack it before conversion");
+    die ("MZ executable appears to be EXEPACK/LZ-style packed; provide a plain DOS executable");
 
   if (entry + 5u <= image_len
       && image[entry] == 0x06 && image[entry + 1u] == 0x0e
       && image[entry + 2u] == 0x1f && image[entry + 3u] == 0x8b
       && image[entry + 4u] == 0x0e)
-    die ("MZ executable appears to be EXEPACK/LZ-style packed; unpack it before conversion");
+    die ("MZ executable appears to be EXEPACK/LZ-style packed; provide a plain DOS executable");
 }
 
 static size_t
@@ -889,7 +886,6 @@ ne_add_env_segment (struct image *img)
   return ne_add_segment (img, 0x111000u, env, sizeof (env), NESEG_DATA);
 }
 
-static uint16_t align_para (uint32_t bytes);
 
 static void
 emit_ne_mov_ax_segment (struct ne_seg_image *seg, unsigned target_seg)
@@ -1064,6 +1060,8 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
                       const struct runtime_info *rt,
                       int raw_keyboard, int direct_video, int install_int16,
                       uint16_t int16_handler,
+                      int startup_video_mode_set,
+                      uint8_t startup_video_mode,
                       uint16_t psp_top_para, int separate_psp,
                       unsigned psp_seg, unsigned psp_top_seg,
                       unsigned env_seg, uint16_t initial_sp)
@@ -1141,8 +1139,12 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
   vec_append (&seg->bytes, copy_tail, sizeof (copy_tail));
   if (direct_video)
     emit_save_initial_video_mode (&seg->bytes, rt);
-  if (raw_keyboard)
+  if (raw_keyboard || direct_video)
     emit_stdin_raw_mode (&seg->bytes, rt);
+  if (direct_video && startup_video_mode_set)
+    emit_startup_video_mode (&seg->bytes, rt, startup_video_mode);
+  else if (direct_video)
+    emit_claim_console_video (&seg->bytes, rt);
   if (separate_psp)
     emit_ne_set_ds_es_to_segment (seg, psp_seg);
   if (initial_sp)
@@ -1417,6 +1419,8 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
                             stats->bios_keyboard_input,
                             stats->direct_video_output,
                             stats->dynamic_int16, int16_handler,
+                            opts->startup_video_mode_set,
+                            opts->startup_video_mode,
                             psp_top_para, separate_psp, psp_seg, psp_top_seg,
                             env_seg, h->sp);
     }
@@ -1426,6 +1430,8 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
                                            entry_phys),
                           0, 0, &rt, stats->bios_keyboard_input,
                           stats->direct_video_output, 0, 0,
+                          opts->startup_video_mode_set,
+                          opts->startup_video_mode,
                           psp_top_para, separate_psp, psp_seg, psp_top_seg,
                           env_seg, h->sp);
   if (img->ne_seg[0].bytes.len > ELKS_MAX16)
@@ -1440,7 +1446,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
              code_para, data_para, img->ne_nsegs, img->heap, img->stack);
 }
 
-static void
+void
 convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
             struct image *img, struct patch_stats *stats)
 {
@@ -1605,12 +1611,16 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
                               &rt,
                               stats->bios_keyboard_input,
                               stats->direct_video_output,
-                              stats->dynamic_int16, int16_handler);
+                              stats->dynamic_int16, int16_handler,
+                              opts->startup_video_mode_set,
+                              opts->startup_video_mode);
     }
   else
     append_mz_argv_startup (img, h.ip, 0, 0, &rt,
                             stats->bios_keyboard_input,
-                            stats->direct_video_output, 0, 0);
+                            stats->direct_video_output, 0, 0,
+                            opts->startup_video_mode_set,
+                            opts->startup_video_mode);
 
   if (opts->verbose)
     fprintf (stderr,

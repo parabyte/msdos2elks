@@ -1,5 +1,6 @@
 #include "internal.h"
 
+void
 patch_com_segment_setup (struct byte_vec *text, struct patch_stats *stats)
 {
   size_t i;
@@ -79,7 +80,7 @@ patch_com_segment_setup (struct byte_vec *text, struct patch_stats *stats)
     }
 }
 
-static void
+void
 patch_mz_stack_setup (struct byte_vec *text, struct patch_stats *stats)
 {
   size_t i;
@@ -119,7 +120,7 @@ patch_mz_stack_setup (struct byte_vec *text, struct patch_stats *stats)
     }
 }
 
-static void
+void
 patch_dos_stack_switches (struct byte_vec *text, struct patch_stats *stats)
 {
   size_t i;
@@ -151,12 +152,14 @@ patch_dos_stack_switches (struct byte_vec *text, struct patch_stats *stats)
     }
 }
 
-static void
+void
 append_com_argv_startup (struct image *img, int install_int21,
                          uint16_t int21_handler,
                          const struct runtime_info *rt, int raw_keyboard,
                          int direct_video, int install_int16,
-                         uint16_t int16_handler)
+                         uint16_t int16_handler,
+                         int startup_video_mode_set,
+                         uint8_t startup_video_mode)
 {
   static const uint8_t prefix[] = {
     0x55,                   /* push bp */
@@ -225,8 +228,12 @@ append_com_argv_startup (struct image *img, int install_int21,
   vec_append (&img->text, prefix, sizeof (prefix));
   if (direct_video)
     emit_save_initial_video_mode (&img->text, rt);
-  if (raw_keyboard)
+  if (raw_keyboard || direct_video)
     emit_stdin_raw_mode (&img->text, rt);
+  if (direct_video && startup_video_mode_set)
+    emit_startup_video_mode (&img->text, rt, startup_video_mode);
+  else if (direct_video)
+    emit_claim_console_video (&img->text, rt);
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding COM argv startup");
 
@@ -236,7 +243,7 @@ append_com_argv_startup (struct image *img, int install_int21,
   img->entry = (uint16_t) start;
 }
 
-static void
+void
 install_com_return_exit (struct image *img, const struct runtime_info *rt)
 {
   size_t exit_off;
@@ -254,12 +261,14 @@ install_com_return_exit (struct image *img, const struct runtime_info *rt)
   put16 (img->text.data + 1u, rel);
 }
 
-static void
+void
 append_mz_argv_startup (struct image *img, uint16_t original_entry,
                         int install_int21, uint16_t int21_handler,
                         const struct runtime_info *rt, int raw_keyboard,
                         int direct_video, int install_int16,
-                        uint16_t int16_handler)
+                        uint16_t int16_handler,
+                        int startup_video_mode_set,
+                        uint8_t startup_video_mode)
 {
   static const uint8_t prefix[] = {
     0x55,                   /* push bp */
@@ -328,8 +337,12 @@ append_mz_argv_startup (struct image *img, uint16_t original_entry,
   vec_append (&img->text, prefix, sizeof (prefix));
   if (direct_video)
     emit_save_initial_video_mode (&img->text, rt);
-  if (raw_keyboard)
+  if (raw_keyboard || direct_video)
     emit_stdin_raw_mode (&img->text, rt);
+  if (direct_video && startup_video_mode_set)
+    emit_startup_video_mode (&img->text, rt, startup_video_mode);
+  else if (direct_video)
+    emit_claim_console_video (&img->text, rt);
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding MZ argv startup");
 
@@ -339,7 +352,7 @@ append_mz_argv_startup (struct image *img, uint16_t original_entry,
   img->entry = (uint16_t) start;
 }
 
-static void
+void
 init_image_memory (struct image *img, const struct options *opts)
 {
   img->stack = opts->stack;
@@ -347,13 +360,13 @@ init_image_memory (struct image *img, const struct options *opts)
   img->bss = opts->bss;
 }
 
-static uint16_t
+uint16_t
 align_para (uint32_t bytes)
 {
   return (uint16_t) ((bytes + 15u) >> 4);
 }
 
-static void
+void
 append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
                               uint16_t stack, uint16_t bss,
                               struct runtime_info *rt)
@@ -414,11 +427,9 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
   put16 (data->data + rt->heap_limit_off, limit_para);
 }
 
-static void
+void
 append_runtime_state (struct image *img, struct runtime_info *rt)
 {
   append_runtime_state_to_data (&img->data, img->heap, img->stack, img->bss,
                                 rt);
 }
-
-static void

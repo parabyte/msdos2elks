@@ -4,20 +4,17 @@
 input under a monitor, or wrap the original file in a compatibility shell.  The
 output is intended to be loaded by ELKS as a normal application.
 
-COM inputs are emitted as ELKS Minix a.out.  MZ EXE inputs are emitted as OS/2
-1.x NE by default, so users should enable `CONFIG_EXEC_OS2=y` in the target ELKS
-build.
+COM inputs are emitted as ELKS Minix a.out.  MZ EXE inputs use automatic output
+selection: native ELKS a.out when the program can be flattened, and OS/2 1.x NE
+only for segmented cases that need it.
 
 ## Input Detection
 
 The converter accepts DOS `.COM` files and MZ `.EXE` files.  `--format=auto`
 checks for MZ/ZM headers and otherwise treats the input as COM.  Known packed,
-compressed, and self-extracting signatures are rejected early because the bytes
-at the entry point belong to the unpacker, not the program that should run.
-
-`unpack-and-convert.sh` is the supported path for packed inputs.  It reveals a
-plain DOS image with locally installed unpacking tools, then retries the same
-converter.
+archive, and self-extracting signatures are rejected early because the bytes at
+the entry point belong to a loader stub, not the program that should run.  The
+project intentionally contains no compression or decompression code.
 
 ## Source Layout
 
@@ -32,8 +29,9 @@ src/mz_os2.c       handles MZ parsing and OS/2 NE segment construction
 src/output.c       writes ELKS a.out and OS/2 NE executable files
 ```
 
-`msdos2elks.c` includes these modules as one translation unit.  That keeps
-helper functions file-local while avoiding a large monolithic source file.
+The Makefile builds these modules as separate objects and links them into the
+host converter.  Shared internal helpers are declared in `src/internal.h`, and
+subsystem-local helpers stay `static` in their own files.
 
 ## COM Layout
 
@@ -55,22 +53,20 @@ The default COM scratch area is 32768 bytes.  `--bss=BYTES` changes that size.
 
 ## MZ And Multi-Segment Layout
 
-For MZ inputs, the default output is an OS/2 1.x NE executable.  That path
-preserves multiple 16-bit segments and internal fixups for ELKS builds with
-`CONFIG_EXEC_OS2=y`.
-
-If `--mz-output=aout` is requested, the converter emits one ELKS text segment
-and one ELKS data segment.  It chooses a code paragraph from the MZ `CS` entry
-state and a data paragraph from `SS` or relocation evidence, then maps MZ
-relocation records into ELKS relocation records when the referenced segment fits
-inside the selected text or data window.
+For MZ inputs, the default output is automatic.  The converter emits one ELKS
+text segment and one ELKS data segment when the MZ can be flattened.  It
+chooses a code paragraph from the MZ `CS` entry state and a data paragraph from
+`SS` or relocation evidence, then maps MZ relocation records into ELKS
+relocation records when the referenced segment fits inside the selected text or
+data window.
 
 Far calls, far jumps, far pointer tables, and adjacent offset/segment
 construction are adjusted when the target paragraph is known.  If flattening
 would truncate a segment, strict conversion fails.
 
-`--mz-output=auto` keeps the old hybrid policy: emit a.out when the MZ can be
-flattened, and emit NE when flattening cannot represent the program.
+`--mz-output=auto` emits a.out when the MZ can be flattened, and emits NE when
+flattening cannot represent the program.  The NE path preserves multiple
+16-bit segments and internal fixups for ELKS builds with `CONFIG_EXEC_OS2=y`.
 
 ## Interrupt Rewriting
 

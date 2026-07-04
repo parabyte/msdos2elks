@@ -17,37 +17,27 @@ main (int argc, char **argv)
   struct image img;
   struct patch_stats stats;
   uint8_t *input;
-  uint8_t *revealed;
-  const uint8_t *convert_input;
   size_t input_len;
-  size_t convert_len;
   int is_mz;
 
   parse_options (argc, argv, &opts);
   input = read_file (opts.input, &input_len);
-  revealed = NULL;
-  convert_input = input;
-  convert_len = input_len;
   memset (&img, 0, sizeof (img));
   memset (&stats, 0, sizeof (stats));
 
   if (opts.format != FMT_COM && is_zip_archive (input, input_len))
-    die ("input appears to be a ZIP/SFX archive; extract it before conversion");
+    die ("input appears to be a ZIP/SFX archive; provide a plain DOS executable");
 
   is_mz = input_len >= 2u
           && (get16 (input) == MZ_MAGIC || get16 (input) == ZM_MAGIC);
-  if ((opts.format == FMT_EXE || (opts.format == FMT_AUTO && is_mz))
-      && pklite_reveal_mz (input, input_len, &revealed, &convert_len,
-                           opts.verbose))
-    convert_input = revealed;
 
   if (opts.format == FMT_EXE || (opts.format == FMT_AUTO && is_mz))
     stats.dynamic_int21 = 1;
 
   if (opts.format == FMT_EXE || (opts.format == FMT_AUTO && is_mz))
-    convert_mz (convert_input, convert_len, &opts, &img, &stats);
+    convert_mz (input, input_len, &opts, &img, &stats);
   else
-    convert_com (convert_input, convert_len, &opts, &img, &stats);
+    convert_com (input, input_len, &opts, &img, &stats);
 
   if (stats.unsupported)
     {
@@ -62,11 +52,12 @@ main (int argc, char **argv)
       if (img.os2_ne)
         fprintf (stderr,
                  "msdos2elks: patched=%u unsupported=%u dynamic-int21=%u"
-                 " dynamic-int16=%u bios-keyboard=%u"
+                 " dynamic-int10=%u dynamic-int16=%u bios-keyboard=%u"
                  " direct-video=%u com-segment-fixes=%u stack-fixes=%u"
                  " os2-ne-segs=%u\n",
                  stats.patched, stats.unsupported,
                  stats.dynamic_int21 ? 1u : 0u,
+                 stats.dynamic_int10 ? 1u : 0u,
                  stats.dynamic_int16 ? 1u : 0u,
                  stats.bios_keyboard_input ? 1u : 0u,
                  stats.direct_video_output ? 1u : 0u,
@@ -74,11 +65,12 @@ main (int argc, char **argv)
       else
         fprintf (stderr,
                  "msdos2elks: patched=%u unsupported=%u dynamic-int21=%u"
-                 " dynamic-int16=%u bios-keyboard=%u"
+                 " dynamic-int10=%u dynamic-int16=%u bios-keyboard=%u"
                  " direct-video=%u com-segment-fixes=%u stack-fixes=%u"
                  " text=%u data=%u trel=%u drel=%u\n",
                  stats.patched, stats.unsupported,
                  stats.dynamic_int21 ? 1u : 0u,
+                 stats.dynamic_int10 ? 1u : 0u,
                  stats.dynamic_int16 ? 1u : 0u,
                  stats.bios_keyboard_input ? 1u : 0u,
                  stats.direct_video_output ? 1u : 0u,
@@ -88,7 +80,6 @@ main (int argc, char **argv)
     }
 
   free_image (&img);
-  free (revealed);
   free (input);
   return stats.unsupported ? 2 : 0;
 }

@@ -6,9 +6,10 @@ rewrites statically recognized DOS and BIOS I/O calls into ELKS `int 80h`
 syscall adapter stubs or compatibility stubs.
 
 This is not a DOS emulator and it does not wrap the input binary in a runtime.
-COM inputs are emitted as ELKS Minix a.out.  MZ EXE inputs are emitted as
-OS/2 1.x NE by default, which requires `CONFIG_EXEC_OS2=y` in the target ELKS
-build and lets the converter preserve more 16-bit segment layouts.
+COM inputs are emitted as ELKS Minix a.out.  MZ EXE inputs use automatic
+output selection: flat-compatible XT-era EXEs are emitted as native ELKS
+a.out, while larger segmented EXEs can fall back to OS/2 1.x NE when an ELKS
+build with `CONFIG_EXEC_OS2=y` is available.
 
 ## Quick Start
 
@@ -22,18 +23,14 @@ make check
 ./msdos2elks program.exe program
 ```
 
-Enable OS/2 executable support in ELKS before running converted `.EXE` outputs:
-in upstream ELKS, run `make menuconfig`, open `Executable file formats`, enable
-`Support OS/2 executables`, save, and rebuild.  This sets `CONFIG_EXEC_OS2=y`.
+For plain small `.EXE` programs, the default output is the standard ELKS a.out
+format.  Enable OS/2 executable support in ELKS only when you deliberately use
+`--mz-output=os2`, or when `--mz-output=auto` reports that a larger segmented
+EXE needed NE output.
 
-PKLITE MZ inputs supported by the built-in revealer are converted directly.
-For other packed DOS inputs, use the unpack helper.  It tries a direct
-conversion first, then uses locally available unpackers before retrying the
-converter:
-
-```sh
-./unpack-and-convert.sh packed-or-sfx.exe program
-```
+Inputs must already be plain DOS `.COM` or MZ `.EXE` binaries.  Packed files,
+archives, and installer stubs are rejected because their entry point is not the
+program that should be rewritten.
 
 Detailed conversion instructions are in `docs/CONVERTING.md`.  A technical
 description of the rewriter is in `docs/HOW-IT-WORKS.md`.  Common failure
@@ -69,7 +66,6 @@ The `msdos2elks` and `*.o` build outputs are intentionally ignored by git.
 ```sh
 ./msdos2elks hello.com hello
 ./msdos2elks program.exe program
-./unpack-and-convert.sh packed-or-sfx.exe program
 tools/convert-directory.sh ~/dos-games converted-games
 ```
 
@@ -84,7 +80,7 @@ Useful options:
 --stack=BYTES             ELKS minimum stack size.
 --heap=BYTES              ELKS heap request.  0 keeps the ELKS default.
 --bss=BYTES               Extra zero-filled ELKS bss.
---mz-output=os2|aout|auto MZ output mode.  Default os2.
+--mz-output=os2|aout|auto MZ output mode.  Default auto.
 --mz-code-seg=PARA        Override the MZ code segment paragraph.
 --mz-data-seg=PARA        Override the MZ data segment paragraph.
 --partial                 Write output even with unsupported DOS calls.
@@ -97,12 +93,6 @@ Convert one plain DOS program:
 
 ```sh
 ./msdos2elks APPS/HELLO.COM hello
-```
-
-Convert a packed executable with automatic unpack attempts:
-
-```sh
-./unpack-and-convert.sh GAMES/LEMMINGS/LEMMINGS.EXE lemmings
 ```
 
 Batch-convert a directory tree, keeping logs for failures:
@@ -125,7 +115,6 @@ resource files, not just the converted executable.
 ## Repository Layout
 
 ```text
-msdos2elks.c              Small umbrella translation unit.
 src/internal.h            Shared converter types, constants, and helpers.
 src/common.c              Byte-vector, relocation, and endian helpers.
 src/cli.c                 Option parsing and host file input.
@@ -293,41 +282,16 @@ available paragraph count in `BX`.
 ## Packed Inputs
 
 Packed binaries are not converted while still packed.  The packed entry stub is
-the wrong program to translate, so `msdos2elks` first reveals supported PKLITE
-MZ inputs to a plain in-memory MZ image and converts that image.  Other known
-LZEXE, EXEPACK/LZ-style, ZIP/SFX, and compressed installer signatures are
-rejected.  Use `unpack-and-convert.sh` when the input may use a packer that is
-not handled internally:
-
-```sh
-./unpack-and-convert.sh game.exe game
-MSDOS2ELKS_UNPACKER=/path/to/unpacker ./unpack-and-convert.sh game.exe game
-MSDOS2ELKS_UNPACK_CMD='my-unpacker "$MSDOS2ELKS_INPUT" "$MSDOS2ELKS_OUTPUT"' \
-  ./unpack-and-convert.sh game.exe game
-```
-
-The helper tries the converter directly first, recursively extracts ZIP/SFX
-payloads with `unzip` or `7z`, runs available `upx`, `unlzexe`, and `unp`
-tools, and then retries every produced `.EXE`/`.COM`.  LZEXE and unsupported
-PKLITE variants can still be handled with `gamecomp` when available; if `npm`
-and `node` are present, the helper can also run `@camoto/gamecomp` directly for
-LZEXE and a temporary patched copy for the old PKLITE 1.03 extra-compression
-relocation terminator used by titles such as Lemmings.  Set
-`MSDOS2ELKS_UNPACK_NPM_GAMECOMP=0` to disable that npm-backed path.
-Custom unpack hooks remain available for packers that need separate licensed or
-locally supplied tools.  If no unpacker produces a plain DOS image, conversion
-fails rather than emitting a fake ELKS executable.
-
-The unpack helper uses a private temporary directory and deletes it on exit.
-`MSDOS2ELKS_TMP_ROOT` can move that scratch area off `/tmp`, and
-`MSDOS2ELKS_UNPACK_TMP_LIMIT_KB` caps per-input unpack scratch use.  The default
-cap is `131072` KiB.
+the wrong program to translate, and this project intentionally contains no
+compression or decompression code.  Known archive, SFX, and packer signatures
+are rejected early.  Prepare a plain DOS `.COM` or MZ `.EXE` outside this tree,
+then pass that plain file to `msdos2elks`.
 
 ## Limits
 
 The converter intentionally refuses arbitrary DOS features.  It does not
 emulate DOS, TSRs, arbitrary direct hardware access, custom interrupt handlers,
-packed executables that have not been unpacked, or self-modifying code that
+packed executables, archives, installer stubs, or self-modifying code that
 expects `CS == DS`.  Dynamic DOS `int 21h` sites are handled through the
 process-local interrupt vector adapter, but dynamic BIOS calls are passthrough
 unless a static adapter can be safely installed.  Direct BIOS/video calls that
@@ -339,30 +303,27 @@ flattened into one 16-bit text or data window; arbitrary segment-register
 switching and far runtime models (`LDS`/`LES`, custom far returns,
 environment-block walkers) may still need deeper whole-program segment
 rewriting.  The FCB layer is a compatibility layer, not a full DOS directory and
-random-record implementation.  ZIP/SFX archives with `.EXE` names must be
-extracted before conversion.
+random-record implementation.
 
 ## OS/2 NE Output
 
-MZ `.EXE` conversion emits an OS/2 1.x NE executable by default.  ELKS can load
-these when `CONFIG_EXEC_OS2=y` is enabled in the target ELKS build.  The NE path
-preserves several 16-bit code/data segments, emits internal segment fixups, and
-keeps each segment under the ELKS loader's `MAX_SEGS` limit, currently 5.
+MZ `.EXE` conversion uses native ELKS Minix a.out whenever the selected text and
+data windows fit the 16-bit ELKS format.  ELKS can also load OS/2 1.x NE files
+when `CONFIG_EXEC_OS2=y` is enabled in the target build.  The NE path preserves
+several 16-bit code/data segments, emits internal segment fixups, and keeps each
+segment under the ELKS loader's `MAX_SEGS` limit, currently 5.
 
-Use `--mz-output=aout` only when you deliberately want the older flat Minix
-a.out MZ path.  Use `--mz-output=auto` to emit a.out for flat-compatible MZ
-inputs and NE only when the flat shape cannot represent the program.
+Use `--mz-output=aout` when you want to require native ELKS a.out and fail if
+the MZ image cannot be flattened.  Use `--mz-output=os2` only when the target
+ELKS build includes OS/2 executable support.  The default `--mz-output=auto`
+emits a.out for flat-compatible MZ inputs and NE only when the flat shape cannot
+represent the program.
 
 The NE writer caps default heap requests so the ELKS loader can fit the auto
 data segment, stack, argv copy, and heap inside one 64 KiB segment.  Explicit
 `--heap` or `--stack` requests are still treated as hard requirements and fail
 if they cannot be represented.
 
-This is the path used for large pre-1992 MZ games such as Lemmings after
-PKLITE reveal.  It removes the previous flat-converter failure where the DOS
-data segment started beyond the first 64K.  Large games may need an ELKS boot
-profile with less kernel heap and cache pressure so `fmemalloc` can satisfy
-their DOS arena request; for example, Lemmings CGA was validated with
-`task=6 buf=8 cache=4 file=20 inode=24 heap=15000`.  Runtime validation for NE
-binaries must be done inside ELKS or on real hardware; `elksemu` only accepts
-ELKS Minix a.out binaries and reports NE files as not being ELKS binaries.
+Runtime validation for NE binaries must be done inside ELKS or on real
+hardware; `elksemu` only accepts ELKS Minix a.out binaries and reports NE files
+as not being ELKS binaries.

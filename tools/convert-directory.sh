@@ -3,15 +3,13 @@
 #
 # Successful conversions are written directly to the output directory.  Logs
 # are kept separately so a failed title can be inspected without polluting the
-# converted program set.  The unpack helper is preferred when present because a
-# large fraction of DOS-era executables are LZEXE, PKLITE, EXEPACK, or SFX
-# wrapped and must be revealed before static rewriting is meaningful.
+# converted program set.  Inputs must already be plain DOS binaries; this
+# project intentionally contains no compression or decompression helper.
 
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "$0")/.." && pwd)
 converter=${MSDOS2ELKS:-$script_dir/msdos2elks}
-unpack_helper=$script_dir/unpack-and-convert.sh
 
 usage ()
 {
@@ -24,8 +22,6 @@ Examples:
 
 Environment:
   MSDOS2ELKS=/path/to/msdos2elks        override converter path
-  MSDOS2ELKS_NO_UNPACK=1                skip unpack-and-convert.sh
-  MSDOS2ELKS_TMP_ROOT=/path             unpack scratch directory root
 EOF
 }
 
@@ -95,16 +91,9 @@ while IFS= read -r input; do
 
   printf 'convert-directory: %s -> %s\n' "$input" "$out"
 
-  if [ "${MSDOS2ELKS_NO_UNPACK:-0}" != 1 ] && [ -x "$unpack_helper" ]; then
-    if "$unpack_helper" "$@" "$input" "$out" > "$log" 2>&1; then
-      ok=$((ok + 1))
-      continue
-    fi
-  else
-    if "$converter" "$@" "$input" "$out" > "$log" 2>&1; then
-      ok=$((ok + 1))
-      continue
-    fi
+  if "$converter" "$@" "$input" "$out" > "$log" 2>&1; then
+    ok=$((ok + 1))
+    continue
   fi
 
   rm -f "$out"

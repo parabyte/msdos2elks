@@ -43,11 +43,12 @@ usage (FILE *out)
            "  --mz-output=os2|aout|auto\n"
            "  --mz-code-seg=PARA\n"
            "  --mz-data-seg=PARA\n"
+           "  --startup-video-mode=MODE\n"
            "  --partial\n"
            "  --verbose\n");
 }
 
-static void
+void
 parse_options (int argc, char **argv, struct options *opts)
 {
   int i;
@@ -55,7 +56,7 @@ parse_options (int argc, char **argv, struct options *opts)
 
   memset (opts, 0, sizeof (*opts));
   opts->format = FMT_AUTO;
-  opts->mz_output = MZ_OUT_OS2;
+  opts->mz_output = MZ_OUT_AUTO;
   opts->stack = ELKS_DEFAULT_STACK;
   opts->heap = 0;
 
@@ -118,6 +119,14 @@ parse_options (int argc, char **argv, struct options *opts)
           opts->mz_data_seg = parse_u16 (value, "MZ data segment");
           opts->mz_data_set = 1;
         }
+      else if (parse_prefixed_arg (argv[i], "--startup-video-mode", &value))
+        {
+          uint16_t mode = parse_u16 (value, "startup video mode");
+          if (mode > 0x7fu)
+            die ("--startup-video-mode must be a BIOS mode byte 0x00..0x7f");
+          opts->startup_video_mode = (uint8_t) mode;
+          opts->startup_video_mode_set = 1;
+        }
       else if (argv[i][0] == '-')
         {
           fprintf (stderr, "msdos2elks: unknown option '%s'\n", argv[i]);
@@ -139,7 +148,7 @@ parse_options (int argc, char **argv, struct options *opts)
     }
 }
 
-static uint8_t *
+uint8_t *
 read_file (const char *path, size_t *len_out)
 {
   FILE *fp;
@@ -170,4 +179,3 @@ read_file (const char *path, size_t *len_out)
   *len_out = (size_t) pos;
   return buf;
 }
-

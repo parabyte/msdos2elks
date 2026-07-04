@@ -4,20 +4,10 @@ This page lists common conversion and validation failures.
 
 ## `packed executable`
 
-The input still contains a packer stub.  Use the unpack helper:
-
-```sh
-./unpack-and-convert.sh GAME.EXE game
-```
-
-If the helper cannot unpack the file automatically, install a tool for that
-packer or provide a local hook:
-
-```sh
-MSDOS2ELKS_UNPACKER=/path/to/unpacker ./unpack-and-convert.sh GAME.EXE game
-MSDOS2ELKS_UNPACK_CMD='my-unpacker "$MSDOS2ELKS_INPUT" "$MSDOS2ELKS_OUTPUT"' \
-  ./unpack-and-convert.sh GAME.EXE game
-```
+The input still contains a packer, archive, or installer stub.  This converter
+does not include compression or decompression code.  Prepare a plain DOS
+`.COM` or MZ `.EXE` outside this tree, then rerun `msdos2elks` on that plain
+file.
 
 ## `unsupported int`
 
@@ -60,17 +50,9 @@ video memory writes.
 ## `text or data segment too large`
 
 The flat ELKS a.out path cannot represent the program in one 16-bit text window
-and one 16-bit data window.  For MZ inputs, use the default OS/2 NE path and run
-the result on an ELKS build with `CONFIG_EXEC_OS2=y`.
+and one 16-bit data window.  For MZ inputs, use `--mz-output=auto` or
+`--mz-output=os2` and run any resulting NE file on an ELKS build with
+`CONFIG_EXEC_OS2=y`.
 
 In upstream ELKS, run `make menuconfig`, open `Executable file formats`, enable
 `Support OS/2 executables`, save, and rebuild.
-
-## `/tmp` Fills During Unpacking
-
-Move scratch space or lower the unpack limit:
-
-```sh
-MSDOS2ELKS_TMP_ROOT=/var/tmp ./unpack-and-convert.sh GAME.EXE game
-MSDOS2ELKS_UNPACK_TMP_LIMIT_KB=65536 ./unpack-and-convert.sh GAME.EXE game
-```

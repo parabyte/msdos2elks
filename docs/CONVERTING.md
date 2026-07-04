@@ -31,10 +31,9 @@ make install DESTDIR=/tmp/msdos2elks-package
 ```
 
 The output path is the final ELKS binary.  COM inputs become ELKS Minix a.out.
-MZ EXE inputs become OS/2 1.x NE by default.  Enable OS/2 executable support in
-ELKS before running converted EXE outputs: in upstream ELKS, run
-`make menuconfig`, open `Executable file formats`, enable
-`Support OS/2 executables`, save, and rebuild.  This sets `CONFIG_EXEC_OS2=y`.
+Flat-compatible MZ EXE inputs become native ELKS a.out by default.  Larger
+segmented EXEs can fall back to OS/2 1.x NE; enable OS/2 executable support in
+ELKS only for those outputs or when using `--mz-output=os2`.
 
 The converter is strict by default: if it cannot safely rewrite a required DOS
 feature, it exits with an error and does not leave behind a misleading
@@ -47,7 +46,7 @@ Useful options:
 --stack=BYTES             Minimum ELKS stack request.
 --heap=BYTES              ELKS heap request, or 0 for the ELKS default.
 --bss=BYTES               Extra zero-filled memory for DOS-style scratch data.
---mz-output=os2|aout|auto MZ output mode.  Default os2.
+--mz-output=os2|aout|auto MZ output mode.  Default auto.
 --partial                 Diagnostic output even when unsupported sites remain.
 --verbose                 Print layout and rewrite details.
 ```
@@ -56,34 +55,18 @@ Useful options:
 MZ `minalloc` values that exceed ELKS' representable maximum heap request are
 saturated to `0xfff0`.
 
-`--mz-output=aout` forces the older flat Minix a.out path for MZ inputs and
-fails if the program cannot fit one 16-bit text window and one 16-bit data
-window.  `--mz-output=auto` chooses a.out for flat-compatible MZ inputs and NE
-for larger segmented inputs.
+`--mz-output=aout` forces native Minix a.out for MZ inputs and fails if the
+program cannot fit one 16-bit text window and one 16-bit data window.
+`--mz-output=auto` chooses a.out for flat-compatible MZ inputs and NE for larger
+segmented inputs.
 
-## 3. Handle Packed Inputs
+## 3. Prepare Plain Inputs
 
-Packed DOS executables must be unpacked before conversion.  Translating the
-packer stub would translate the wrong program.
-
-```sh
-./unpack-and-convert.sh GAME.EXE game
-MSDOS2ELKS_UNPACKER=/opt/tools/unpacker ./unpack-and-convert.sh GAME.EXE game
-MSDOS2ELKS_UNPACK_CMD='my-unpacker "$MSDOS2ELKS_INPUT" "$MSDOS2ELKS_OUTPUT"' \
-  ./unpack-and-convert.sh GAME.EXE game
-```
-
-The helper first tries direct conversion, then recursively extracts archives and
-uses locally available tools such as `upx`, `unlzexe`, `unp`, `7z`, and
-`gamecomp`.  It also has an npm-backed `@camoto/gamecomp` path for common LZEXE
-and PKLITE cases when `node` and `npm` are installed.
-
-Scratch space is bounded:
-
-```sh
-MSDOS2ELKS_TMP_ROOT=/var/tmp ./unpack-and-convert.sh GAME.EXE game
-MSDOS2ELKS_UNPACK_TMP_LIMIT_KB=262144 ./unpack-and-convert.sh GAME.EXE game
-```
+Packed DOS executables, archives, and installer stubs are not converted.  Their
+entry bytes belong to a loader or extractor, not the program that should be
+rewritten for ELKS.  This project intentionally contains no compression or
+decompression helper.  Prepare a plain DOS `.COM` or MZ `.EXE` outside this
+tree, then convert that plain file.
 
 ## 4. Convert A Directory
 

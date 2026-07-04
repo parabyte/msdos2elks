@@ -185,7 +185,7 @@ write_os2_ne (const char *path, const struct image *img)
   free (out.data);
 }
 
-static void
+void
 write_elks (const char *path, const struct image *img)
 {
   FILE *fp;
@@ -237,7 +237,7 @@ write_elks (const char *path, const struct image *img)
   free (out.data);
 }
 
-static void
+void
 free_image (struct image *img)
 {
   unsigned i;

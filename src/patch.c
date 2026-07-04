@@ -15,7 +15,7 @@ record_unsupported (struct patch_stats *stats, uint32_t offset, uint8_t intr,
     }
 }
 
-static void
+void
 report_unsupported (const struct patch_stats *stats)
 {
   unsigned i;
@@ -77,6 +77,44 @@ patch_call (struct byte_vec *text, size_t start, size_t len, size_t target,
   put16 (text->data + start + 1u, rel);
   for (i = 3u; i < len; i++)
     text->data[start + i] = 0x90;
+}
+
+static void
+patch_call_then_ret (struct byte_vec *text, size_t start, size_t len,
+                     size_t target)
+{
+  uint16_t rel;
+  size_t i;
+
+  if (len < 4u)
+    die ("internal dynamic wrapper patch is too short");
+
+  rel = (uint16_t) (target - (start + 3u));
+  text->data[start] = 0xe8;        /* call rel16 */
+  put16 (text->data + start + 1u, rel);
+  text->data[start + 3u] = 0xc3;   /* ret to the DOS caller */
+  for (i = 4u; i < len; i++)
+    text->data[start + i] = 0x90;
+}
+
+static int
+range_is_clear (const uint8_t *covered, size_t start, size_t len)
+{
+  size_t i;
+
+  for (i = 0; i < len; i++)
+    if (covered[start + i])
+      return 0;
+  return 1;
+}
+
+static void
+cover_range (uint8_t *covered, size_t start, size_t len)
+{
+  size_t i;
+
+  for (i = 0; i < len; i++)
+    covered[start + i] = 1;
 }
 
 static int
@@ -276,7 +314,7 @@ target_in_range (size_t target, size_t from, size_t to)
   return target >= from && target < to;
 }
 
-static size_t scan_instruction_len (const uint8_t *p, size_t avail);
+size_t scan_instruction_len (const uint8_t *p, size_t avail);
 
 static int
 has_external_branch_target (const uint8_t *data, size_t len, size_t body_from,
@@ -353,6 +391,40 @@ patch_compacted_call (struct byte_vec *text, size_t start, size_t body_start,
     text->data[out++] = 0x90;
 }
 
+static uint32_t
+append_load_al_moffs_call_stub (struct byte_vec *text, uint16_t moffs,
+                                uint32_t target)
+{
+  size_t start = text->len;
+  uint16_t rel;
+
+  /*
+   * Some DOS programs keep the preferred video mode in data memory, clear AH,
+   * load AL through the 8086 absolute-memory "moffs" form, and then call
+   * INT 10h function 00h.  The inline sequence is too short to preserve the
+   * memory load and call the converter's video-mode adapter in place, so this
+   * small per-site helper keeps the memory operand exact and then calls the
+   * shared set-mode stub.  The emitted code uses only 8088/8086 opcodes:
+   *
+   *   mov al,[moffs]
+   *   call set_mode_stub
+   *   ret
+   */
+  if (start > ELKS_MAX16)
+    die ("text segment grew beyond 64 KiB while adding video mode helper");
+
+  emit8 (text, 0xa0);       /* mov al, [moffs] */
+  emit16 (text, moffs);
+  emit8 (text, 0xe8);       /* call set_mode_stub */
+  rel = (uint16_t) (target - (text->len + 2u));
+  emit16 (text, rel);
+  emit8 (text, 0xc3);       /* ret to the patched DOS instruction stream */
+
+  if (text->len > ELKS_MAX16)
+    die ("text segment grew beyond 64 KiB while adding video mode helper");
+  return (uint32_t) start;
+}
+
 static int
 find_compact_call_candidate (const struct byte_vec *text, size_t original_len,
                              size_t int_off, const struct reloc_vec *rels,
@@ -404,7 +476,7 @@ find_compact_call_candidate (const struct byte_vec *text, size_t original_len,
   return 0;
 }
 
-static size_t
+size_t
 scan_instruction_len (const uint8_t *p, size_t avail)
 {
   uint8_t op;
@@ -484,14 +556,18 @@ patchable_interrupt_bank (uint8_t intr)
     {
     case 0x10:
       return 0;
-    case 0x16:
+    case 0x15:
       return 1;
-    case 0x1a:
+    case 0x16:
       return 2;
-    case 0x21:
+    case 0x17:
       return 3;
-    case 0x33:
+    case 0x1a:
       return 4;
+    case 0x21:
+      return 5;
+    case 0x33:
+      return 6;
     default:
       return -1;
     }
@@ -595,25 +671,27 @@ patch_bda_keyboard_status_checks (struct byte_vec *text,
     }
 }
 
-static void
+void
 patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
               const struct runtime_info *rt, const struct reloc_vec *text_relocs)
 {
-  uint32_t stubs[5][256];
+  uint32_t stubs[7][256];
+  uint32_t dynamic_int10_stub;
   uint8_t *covered;
   size_t original_len;
   size_t i;
   unsigned bank;
 
   original_len = text->len;
+  dynamic_int10_stub = UINT32_MAX;
   covered = (uint8_t *) calloc (original_len ? original_len : 1u, 1u);
   if (!covered)
     die ("out of memory");
-  for (bank = 0; bank < 5u; bank++)
+  for (bank = 0; bank < 7u; bank++)
     for (i = 0; i < 256u; i++)
       stubs[bank][i] = UINT32_MAX;
 
-  patch_bda_keyboard_status_checks (text, stats, rt, &stubs[1][0x01],
+  patch_bda_keyboard_status_checks (text, stats, rt, &stubs[2][0x01],
                                     covered, original_len);
   for (i = 0; i + 1u < original_len; )
     {
@@ -625,6 +703,8 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
       uint8_t al = 0;
       int al_known = 0;
       int compact = 0;
+      int load_mode_from_moffs = 0;
+      uint16_t mode_moffs = 0;
       size_t body_start = 0;
       int sbank;
       size_t j;
@@ -656,6 +736,39 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
 
       if (covered[i] || covered[i + 1u])
         {
+          i += insn_len;
+          continue;
+        }
+
+      if (intr == 0x10 && i >= 3u && i + 5u < original_len
+          && text->data[i - 3u] == 0x55
+          && text->data[i - 2u] == 0x56
+          && text->data[i - 1u] == 0x57
+          && text->data[i + 2u] == 0x5f
+          && text->data[i + 3u] == 0x5e
+          && text->data[i + 4u] == 0x5d
+          && text->data[i + 5u] == 0xc3
+          && range_is_clear (covered, i - 3u, 9u)
+          && !range_has_text_reloc (text_relocs, i - 3u, i + 6u))
+        {
+          /*
+           * A lot of DOS graphics code centralizes all BIOS video operations
+           * through a helper like:
+           *
+           *   push bp; push si; push di; int 10h; pop di; pop si; pop bp; ret
+           *
+           * Callers leave AH set to the BIOS video function.  Patch the whole
+           * helper, not a title-specific call site, so every caller gets the
+           * same generic INT 10h compatibility adapter.
+           */
+          if (dynamic_int10_stub == UINT32_MAX)
+            dynamic_int10_stub = emit_bios_dynamic_video_stub (text, rt);
+          patch_call_then_ret (text, i - 3u, 9u, dynamic_int10_stub);
+          cover_range (covered, i - 3u, 9u);
+          stats->patched++;
+          stats->dynamic_int10 = 1;
+          stats->direct_video_output = 1;
+          stats->bios_keyboard_input = 1;
           i += insn_len;
           continue;
         }
@@ -699,6 +812,29 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
           al_known = 1;
           fn = text->data[i - 1u];
         }
+      else if (intr == 0x10 && i >= 5u
+               && text->data[i - 5u] == 0x30
+               && text->data[i - 4u] == 0xe4
+               && text->data[i - 3u] == 0xa0)
+        {
+          /*
+           * Generic dynamic video-mode restore:
+           *
+           *   xor ah,ah
+           *   mov al,[moffs]
+           *   int 10h
+           *
+           * This remains an AH=00h set-video-mode operation even though AL is
+           * loaded from DOS data memory at run time.  Keep the memory load in a
+           * tiny helper and route the mode set through the normal video-mode
+           * adapter so ELKS console ownership is handled consistently.
+           */
+          start = i - 5u;
+          len = 7u;
+          fn = 0;
+          load_mode_from_moffs = 1;
+          mode_moffs = get16 (text->data + i - 2u);
+        }
       else if (intr == 0x21 && i >= 2u
                && text->data[i - 2u] == 0x8a
                && text->data[i - 1u] == 0xe0)
@@ -737,12 +873,45 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
               i += insn_len;
               continue;
             }
-          if (intr == 0x10 || intr == 0x16 || intr == 0x1a || intr == 0x33)
+          if (intr == 0x10)
+            {
+              /*
+               * DOS graphics libraries often centralize BIOS video through
+               * one helper whose caller leaves the function number in AH.
+               * A two-byte "int 10h" cannot be replaced with a near call in
+               * place, but it still tells the generated program to claim the
+               * ELKS console before DOS code starts drawing.  This is a
+               * general BIOS-video compatibility rule, not an application
+               * title check.
+               */
+              stats->dynamic_int10 = 1;
+              stats->direct_video_output = 1;
+              stats->bios_keyboard_input = 1;
+              i += insn_len;
+              continue;
+            }
+          if (intr == 0x1a || intr == 0x33)
             {
               i += insn_len;
               continue;
             }
           record_unsupported (stats, (uint32_t) i, intr, 0, 0);
+          i += insn_len;
+          continue;
+        }
+
+      if (load_mode_from_moffs
+          && range_has_text_reloc (text_relocs, start, start + len))
+        {
+          /*
+           * Do not move a relocated absolute operand unless the relocation
+           * table is also rewritten.  Treat it as dynamic BIOS video instead:
+           * startup will still claim the console, and the original code remains
+           * byte-for-byte valid.
+           */
+          stats->dynamic_int10 = 1;
+          stats->direct_video_output = 1;
+          stats->bios_keyboard_input = 1;
           i += insn_len;
           continue;
         }
@@ -798,10 +967,17 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
       if (compact)
         patch_compacted_call (text, start, body_start, i, stubs[sbank][fn],
                               al_known, al);
+      else if (load_mode_from_moffs)
+        {
+          uint32_t site_stub;
+
+          site_stub = append_load_al_moffs_call_stub (text, mode_moffs,
+                                                      stubs[sbank][fn]);
+          patch_call (text, start, len, site_stub, 0, 0);
+        }
       else
         patch_call (text, start, len, stubs[sbank][fn], al_known, al);
-      for (j = start; j < start + len; j++)
-        covered[j] = 1;
+      cover_range (covered, start, len);
       stats->patched++;
       if (intr == 0x16 || (intr == 0x21 && dos_keyboard_function (fn)))
         stats->bios_keyboard_input = 1;
@@ -812,5 +988,3 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
 
   free (covered);
 }
-
-static void

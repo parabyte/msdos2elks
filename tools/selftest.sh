@@ -7,9 +7,10 @@
 #   msg db 'Hi$'
 #
 # The converter should recognize the DOS console write and process exit calls
-# and produce a non-empty ELKS executable.  The MZ path is checked through
-# explicit OS/2 NE output.  This does not boot ELKS; runtime validation should
-# be done on the target ELKS system.
+# and produce a non-empty ELKS executable.  The default MZ path is checked as
+# native ELKS a.out output, while the explicit OS/2 NE path is kept as a
+# separate compatibility check.  This does not boot ELKS; runtime validation
+# should be done on the target ELKS system.
 
 set -eu
 
@@ -23,6 +24,7 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 input=$tmp/hello.com
 output=$tmp/hello.elks
 mz_input=$tmp/tiny.exe
+mz_aout_output=$tmp/tiny.elks
 mz_output=$tmp/tiny.ne
 stack_input=$tmp/stack.exe
 stack_output=$tmp/stack.ne
@@ -42,6 +44,10 @@ svga_probe_input=$tmp/svgaprobe.com
 svga_probe_output=$tmp/svgaprobe.elks
 display_combo_input=$tmp/displaycombo.com
 display_combo_output=$tmp/displaycombo.elks
+system_config_input=$tmp/systemconfig.com
+system_config_output=$tmp/systemconfig.elks
+packed_com_input=$tmp/packed.com
+packed_com_output=$tmp/packed.elks
 log=$tmp/converter.log
 
 printf '\264\011\272\014\001\315\041\270\000\114\315\041Hi$' > "$input"
@@ -55,6 +61,8 @@ printf '\270\023\000\315\020\270\000\114\315\041' > "$vga_input"
 printf '\263\020\264\022\315\020\270\000\114\315\041' > "$ega_query_input"
 printf '\264\060\315\020\270\000\114\315\041' > "$svga_probe_input"
 printf '\270\000\032\315\020\270\000\114\315\041' > "$display_combo_input"
+printf '\264\300\315\025\270\000\114\315\041' > "$system_config_input"
+printf '\351\000\000UPX!' > "$packed_com_input"
 
 if ! "$converter" --verbose "$input" "$output" > "$log" 2>&1; then
   cat "$log" >&2
@@ -63,6 +71,18 @@ fi
 
 if [ ! -s "$output" ]; then
   printf 'selftest: converter wrote no output\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! "$converter" --verbose "$mz_input" "$mz_aout_output" >> "$log" 2>&1; then
+  cat "$log" >&2
+  exit 1
+fi
+
+mz_aout_magic=$(od -An -tx1 -N4 "$mz_aout_output" | tr -d ' \n')
+if [ "$mz_aout_magic" != 01033004 ]; then
+  printf 'selftest: default MZ input did not produce native ELKS a.out output\n' >&2
   cat "$log" >&2
   exit 1
 fi
@@ -81,7 +101,7 @@ if [ "$mz_magic" != 4d5a ] || [ "$ne_magic" != 4e45 ]; then
   exit 1
 fi
 
-if ! "$converter" --verbose --mz-data-seg=2 \
+if ! "$converter" --verbose --mz-output=os2 --mz-data-seg=2 \
      "$stack_input" "$stack_output" >> "$log" 2>&1; then
   cat "$log" >&2
   exit 1
@@ -140,6 +160,23 @@ if ! "$converter" --verbose "$display_combo_input" "$display_combo_output" >> "$
   exit 1
 fi
 
+if ! "$converter" --verbose "$system_config_input" "$system_config_output" >> "$log" 2>&1; then
+  cat "$log" >&2
+  exit 1
+fi
+
+if "$converter" --verbose "$packed_com_input" "$packed_com_output" >> "$log" 2>&1; then
+  printf 'selftest: packed COM input was not rejected\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! grep -q 'COM executable appears to be UPX packed' "$log"; then
+  printf 'selftest: packed COM rejection message missing\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
 if ! grep -q 'direct-video=1' "$log"; then
   printf 'selftest: graphics video conversion did not claim direct-video output\n' >&2
   cat "$log" >&2
@@ -167,6 +204,12 @@ fi
 
 if ! od -v -An -tx1 "$display_combo_output" | tr -d ' \n' | grep -q '31c031dbf8c3'; then
   printf 'selftest: display-combination probe did not return conservative no-VGA result\n' >&2
+  cat "$log" >&2
+  exit 1
+fi
+
+if ! od -v -An -tx1 "$system_config_output" | tr -d ' \n' | grep -q 'b80100f9c3'; then
+  printf 'selftest: system-configuration probe did not return carry-set failure\n' >&2
   cat "$log" >&2
   exit 1
 fi
@@ -203,5 +246,5 @@ if ! od -v -An -tx1 "$video_output" | tr -d ' \n' | grep -q 'b40bcd10'; then
   exit 1
 fi
 
-printf 'selftest: converted tiny COM to %s bytes and tiny MZ to OS/2 NE\n' \
+printf 'selftest: converted tiny COM to %s bytes and tiny MZ to native a.out; explicit NE checked\n' \
        "$(wc -c < "$output")"
