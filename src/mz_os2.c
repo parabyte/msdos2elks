@@ -937,7 +937,7 @@ ne_auto_top_para (const struct image *img, unsigned data_seg)
    */
   paras = align_para (img->ne_seg[data_seg].min_alloc);
   paras += align_para ((uint32_t) img->stack + NE_ARG_SLACK
-                       + (img->heap ? img->heap : 4096u));
+                       + (img->heap ? img->heap : ELKS_DEFAULT_HEAP));
   if (paras > 0x0fffu)
     paras = 0x0fffu;
   return (uint16_t) paras;
@@ -1058,7 +1058,7 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
                       unsigned target_seg, uint16_t target_off,
                       int install_int21, uint16_t int21_handler,
                       const struct runtime_info *rt,
-                      int raw_keyboard, int direct_video, int install_int16,
+                      int raw_keyboard, int graphics_output, int install_int16,
                       uint16_t int16_handler,
                       int startup_video_mode_set,
                       uint8_t startup_video_mode,
@@ -1137,13 +1137,13 @@ append_ne_mz_startup (struct image *img, unsigned startup_seg,
       emit16 (&seg->bytes, 0x002c);     /* es:[environment] = empty block */
     }
   vec_append (&seg->bytes, copy_tail, sizeof (copy_tail));
-  if (direct_video)
+  if (graphics_output)
     emit_save_initial_video_mode (&seg->bytes, rt);
-  if (raw_keyboard || direct_video)
+  if (raw_keyboard || graphics_output)
     emit_stdin_raw_mode (&seg->bytes, rt);
-  if (direct_video && startup_video_mode_set)
+  if (graphics_output && startup_video_mode_set)
     emit_startup_video_mode (&seg->bytes, rt, startup_video_mode);
-  else if (direct_video)
+  else if (graphics_output)
     emit_claim_console_video (&seg->bytes, rt);
   if (separate_psp)
     emit_ne_set_ds_es_to_segment (seg, psp_seg);
@@ -1417,7 +1417,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
                             stats->dynamic_int21, int21_handler,
                             &rt,
                             stats->bios_keyboard_input,
-                            stats->direct_video_output,
+                            stats->graphics_output,
                             stats->dynamic_int16, int16_handler,
                             opts->startup_video_mode_set,
                             opts->startup_video_mode,
@@ -1429,7 +1429,7 @@ convert_mz_ne (const uint8_t *input, size_t input_len,
                           ne_local_offset (&img->ne_seg[entry_seg],
                                            entry_phys),
                           0, 0, &rt, stats->bios_keyboard_input,
-                          stats->direct_video_output, 0, 0,
+                          stats->graphics_output, 0, 0,
                           opts->startup_video_mode_set,
                           opts->startup_video_mode,
                           psp_top_para, separate_psp, psp_seg, psp_top_seg,
@@ -1610,7 +1610,7 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
       append_mz_argv_startup (img, h.ip, stats->dynamic_int21, int21_handler,
                               &rt,
                               stats->bios_keyboard_input,
-                              stats->direct_video_output,
+                              stats->graphics_output,
                               stats->dynamic_int16, int16_handler,
                               opts->startup_video_mode_set,
                               opts->startup_video_mode);
@@ -1618,7 +1618,7 @@ convert_mz (const uint8_t *input, size_t input_len, const struct options *opts,
   else
     append_mz_argv_startup (img, h.ip, 0, 0, &rt,
                             stats->bios_keyboard_input,
-                            stats->direct_video_output, 0, 0,
+                            stats->graphics_output, 0, 0,
                             opts->startup_video_mode_set,
                             opts->startup_video_mode);
 

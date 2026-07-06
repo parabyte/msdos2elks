@@ -91,31 +91,30 @@ Adapters preserve the DOS carry-flag convention: success returns with carry
 clear, while negative ELKS errors become positive DOS error numbers with carry
 set.
 
-## BIOS Video And Keyboard
+## BIOS-Compatible Video And Keyboard
 
-Basic BIOS video and keyboard services are handled in two ways:
+Basic BIOS-compatible video and keyboard services are handled in two ways:
 
 ```text
 text output and keyboard reads       translated through ELKS console I/O
-mode setup and direct video access   passed through or handled by small stubs
+adapter probes and text mode state   handled by deterministic small stubs
+graphics modes and raw video memory  rejected by strict conversion
 ```
 
-Direct video memory access is often left intact because many DOS programs write
-to CGA/EGA/VGA memory themselves.  When a converted program switches to a BIOS
-graphics or adapter-specific mode through a rewritten `int 10h` mode-set call,
-the runtime asks ELKS for the console graphics lock and raw keyboard mode before
-calling the ROM BIOS.  That prevents ELKS console output from painting over the
-DOS program while still leaving the real BIOS and hardware in control of the
-selected video mode.  The startup code records the current text mode, and the
-exit path releases raw keyboard mode, restores that text mode when practical,
-and then releases the graphics lock.
+Direct video memory access is not left intact.  The scanner records common
+`A000h`, `B000h`, and `B800h` segment setup patterns as unsupported, because
+the following stores can be arbitrary 8086 code and would bypass the ELKS
+kernel.  Static `int 10h` text-mode requests only update runtime software
+state, `AH=0Eh` teletype writes through the ELKS `write` syscall, and
+`AH=0Fh` reads back the software mode.  The generated code never emits a ROM
+BIOS video interrupt.
 
 Enhanced adapter discovery is intentionally conservative.  Static `int 10h`
 queries such as EGA alternate-select, display-combination, and enhanced video
-information report no useful enhanced-adapter service, while explicit mode-set
-calls still pass through to the BIOS.  This favors the broad CGA/EGA/MDA
-direct-memory paths used by many XT-era DOS libraries instead of letting a
-modern VGA BIOS steer them into incompatible adapter-specific layouts.
+information report no useful enhanced-adapter service.  Graphics mode changes,
+palette changes, pixel reads/writes, cursor/page/scroll services, and dynamic
+video helpers are rejected unless a future ELKS kernel graphics API gives the
+converter a real kernel route for those operations.
 
 ## FCB And DOS Memory Calls
 

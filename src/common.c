@@ -98,16 +98,15 @@ bios_video_mode_is_text (uint8_t mode)
 }
 
 int
-bios_video_mode_needs_console_lock (uint8_t mode)
+bios_video_mode_is_graphics (uint8_t mode)
 {
   /*
    * BIOS modes 00h-03h are CGA text modes and 07h is MDA text mode on
    * IBM PC/XT-class display hardware.  Other mode numbers are graphics
-   * modes or adapter-specific extensions.  A converted DOS program using
-   * those modes may draw directly through B000h/B800h/A000h video memory,
-   * so the generated runtime asks ELKS to stop console painting while the
-   * program owns the display.  Unsupported adapter-specific modes are still
-   * handed to the ROM BIOS; the converter does not emulate or validate them.
+   * modes or adapter-specific extensions.  Standard ELKS does not expose a
+   * kernel pixel API for those modes, and converted DOS programs must not
+   * switch ROM BIOS modes or write B000h/B800h/A000h directly.  Callers use
+   * this predicate to reject graphics mode requests in strict conversion.
    */
   return !bios_video_mode_is_text (mode);
 }

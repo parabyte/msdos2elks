@@ -15,6 +15,21 @@ record_unsupported (struct patch_stats *stats, uint32_t offset, uint8_t intr,
     }
 }
 
+static void
+record_unsupported_raw_video (struct patch_stats *stats, uint32_t offset,
+                              uint16_t segment)
+{
+  stats->unsupported++;
+  if (stats->first_len < sizeof (stats->first) / sizeof (stats->first[0]))
+    {
+      stats->first[stats->first_len].offset = offset;
+      stats->first[stats->first_len].intr = UNSUPPORTED_RAW_VIDEO_MEMORY;
+      stats->first[stats->first_len].known = 1;
+      stats->first[stats->first_len].fn = segment;
+      stats->first_len++;
+    }
+}
+
 void
 report_unsupported (const struct patch_stats *stats)
 {
@@ -22,12 +37,18 @@ report_unsupported (const struct patch_stats *stats)
 
   for (i = 0; i < stats->first_len; i++)
     {
-      if (stats->first[i].known)
+      if (stats->first[i].intr == UNSUPPORTED_RAW_VIDEO_MEMORY)
+        fprintf (stderr,
+                 "msdos2elks: unsupported raw DOS video memory segment %04x"
+                 " at text offset %04x\n",
+                 stats->first[i].fn, (unsigned) stats->first[i].offset);
+      else if (stats->first[i].known)
         fprintf (stderr,
                  "msdos2elks: unsupported int %02xh AH=%02x"
                  " at text offset %04x\n",
                  stats->first[i].intr,
-                 stats->first[i].fn, (unsigned) stats->first[i].offset);
+                 (unsigned) stats->first[i].fn,
+                 (unsigned) stats->first[i].offset);
       else if (stats->first[i].intr == 0x10
                || stats->first[i].intr == 0x16
                || stats->first[i].intr == 0x1a
@@ -79,24 +100,6 @@ patch_call (struct byte_vec *text, size_t start, size_t len, size_t target,
     text->data[start + i] = 0x90;
 }
 
-static void
-patch_call_then_ret (struct byte_vec *text, size_t start, size_t len,
-                     size_t target)
-{
-  uint16_t rel;
-  size_t i;
-
-  if (len < 4u)
-    die ("internal dynamic wrapper patch is too short");
-
-  rel = (uint16_t) (target - (start + 3u));
-  text->data[start] = 0xe8;        /* call rel16 */
-  put16 (text->data + start + 1u, rel);
-  text->data[start + 3u] = 0xc3;   /* ret to the DOS caller */
-  for (i = 4u; i < len; i++)
-    text->data[start + i] = 0x90;
-}
-
 static int
 range_is_clear (const uint8_t *covered, size_t start, size_t len)
 {
@@ -128,6 +131,86 @@ range_has_text_reloc (const struct reloc_vec *rels, size_t start, size_t end)
     if (rels->data[i].vaddr >= start && rels->data[i].vaddr < end)
       return 1;
   return 0;
+}
+
+static int
+is_raw_video_segment (uint16_t segment)
+{
+  return segment == 0xa000u || segment == 0xb000u || segment == 0xb800u;
+}
+
+static int
+loads_segment_from_reg (const uint8_t *data, size_t len, size_t off,
+                        uint8_t reg)
+{
+  uint8_t modrm;
+  uint8_t seg;
+
+  if (off + 1u >= len || data[off] != 0x8e)
+    return 0;
+  modrm = data[off + 1u];
+  if ((modrm & 0xc0u) != 0xc0u || (modrm & 7u) != reg)
+    return 0;
+  seg = (uint8_t) ((modrm >> 3) & 7u);
+  return seg == 0u || seg == 3u;        /* ES or DS */
+}
+
+static void
+scan_raw_video_memory_segments (const struct byte_vec *text,
+                                struct patch_stats *stats)
+{
+  size_t i;
+
+  /*
+   * Raw CGA/MDA/EGA/VGA aperture writes are no longer a valid converted
+   * graphics path.  ELKS must own graphics state through its console graphics
+   * ioctl path; a translated DOS program must not load A000h, B000h, or B800h
+   * into DS/ES and write memory directly.  This scanner catches the common
+   * 8086 compiler and hand-written setup shapes:
+   *
+   *   mov reg, 0b800h ; mov es, reg
+   *   mov reg, 0b000h ; push reg ; pop ds
+   *
+   * Keep it byte-oriented and conservative.  It records unsupported sites
+   * rather than rewriting them into a partial graphics emulator, because the
+   * following stores can be arbitrary string instructions, indexed writes,
+   * read/modify/write sequences, or palette-specific layouts.
+   */
+  for (i = 0; i + 2u < text->len; i++)
+    {
+      uint8_t reg;
+      uint16_t segment;
+      size_t end;
+      size_t j;
+
+      if (text->data[i] < 0xb8 || text->data[i] > 0xbf)
+        continue;                       /* mov r16, imm16 */
+      segment = get16 (text->data + i + 1u);
+      if (!is_raw_video_segment (segment))
+        continue;
+
+      reg = (uint8_t) (text->data[i] & 7u);
+      end = i + 18u < text->len ? i + 18u : text->len;
+      for (j = i + 3u; j < end; j++)
+        {
+          if (loads_segment_from_reg (text->data, text->len, j, reg))
+            {
+              record_unsupported_raw_video (stats, (uint32_t) i, segment);
+              i = j + 1u;
+              break;
+            }
+
+          if (text->data[j] == (uint8_t) (0x50u | reg)
+              && j + 1u < end
+              && (text->data[j + 1u] == 0x07
+                  || text->data[j + 1u] == 0x1f))
+            {
+              record_unsupported_raw_video (stats, (uint32_t) i, segment);
+              i = j + 1u;
+              break;
+            }
+        }
+    }
 }
 
 static size_t
@@ -676,20 +759,20 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
               const struct runtime_info *rt, const struct reloc_vec *text_relocs)
 {
   uint32_t stubs[7][256];
-  uint32_t dynamic_int10_stub;
   uint8_t *covered;
   size_t original_len;
   size_t i;
   unsigned bank;
 
   original_len = text->len;
-  dynamic_int10_stub = UINT32_MAX;
   covered = (uint8_t *) calloc (original_len ? original_len : 1u, 1u);
   if (!covered)
     die ("out of memory");
   for (bank = 0; bank < 7u; bank++)
     for (i = 0; i < 256u; i++)
       stubs[bank][i] = UINT32_MAX;
+
+  scan_raw_video_memory_segments (text, stats);
 
   patch_bda_keyboard_status_checks (text, stats, rt, &stubs[2][0x01],
                                     covered, original_len);
@@ -757,18 +840,15 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
            *
            *   push bp; push si; push di; int 10h; pop di; pop si; pop bp; ret
            *
-           * Callers leave AH set to the BIOS video function.  Patch the whole
-           * helper, not a title-specific call site, so every caller gets the
-           * same generic INT 10h compatibility adapter.
+           * Callers leave AH set to the BIOS video function.  Because the
+           * function number is dynamic, the converter cannot prove that this
+           * helper is limited to ELKS-kernel-backed text output or harmless
+           * adapter probes.  Reject it instead of installing a ROM BIOS
+           * pass-through path.
            */
-          if (dynamic_int10_stub == UINT32_MAX)
-            dynamic_int10_stub = emit_bios_dynamic_video_stub (text, rt);
-          patch_call_then_ret (text, i - 3u, 9u, dynamic_int10_stub);
-          cover_range (covered, i - 3u, 9u);
-          stats->patched++;
+          record_unsupported (stats, (uint32_t) i, intr, 0, 0);
           stats->dynamic_int10 = 1;
-          stats->direct_video_output = 1;
-          stats->bios_keyboard_input = 1;
+          stats->graphics_output = 1;
           i += insn_len;
           continue;
         }
@@ -825,9 +905,9 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
            *   int 10h
            *
            * This remains an AH=00h set-video-mode operation even though AL is
-           * loaded from DOS data memory at run time.  Keep the memory load in a
-           * tiny helper and route the mode set through the normal video-mode
-           * adapter so ELKS console ownership is handled consistently.
+           * loaded from DOS data memory at run time.  Strict conversion only
+           * accepts statically known text modes, so a relocated or unknown
+           * runtime mode is rejected below.
            */
           start = i - 5u;
           len = 7u;
@@ -878,15 +958,13 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
               /*
                * DOS graphics libraries often centralize BIOS video through
                * one helper whose caller leaves the function number in AH.
-               * A two-byte "int 10h" cannot be replaced with a near call in
-               * place, but it still tells the generated program to claim the
-               * ELKS console before DOS code starts drawing.  This is a
-               * general BIOS-video compatibility rule, not an application
-               * title check.
+               * A two-byte "int 10h" cannot be proven to be a supported
+               * ELKS-kernel-backed function, so strict conversion rejects it
+               * instead of leaving a BIOS call in place.
                */
+              record_unsupported (stats, (uint32_t) i, intr, 0, 0);
               stats->dynamic_int10 = 1;
-              stats->direct_video_output = 1;
-              stats->bios_keyboard_input = 1;
+              stats->graphics_output = 1;
               i += insn_len;
               continue;
             }
@@ -905,13 +983,13 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
         {
           /*
            * Do not move a relocated absolute operand unless the relocation
-           * table is also rewritten.  Treat it as dynamic BIOS video instead:
-           * startup will still claim the console, and the original code remains
-           * byte-for-byte valid.
+           * table is also rewritten.  A runtime-loaded video mode cannot be
+           * validated as an ELKS-kernel-backed text-mode request, so reject it
+           * instead of leaving a ROM BIOS set-mode call in place.
            */
+          record_unsupported (stats, (uint32_t) i, intr, 0, 0);
           stats->dynamic_int10 = 1;
-          stats->direct_video_output = 1;
-          stats->bios_keyboard_input = 1;
+          stats->graphics_output = 1;
           i += insn_len;
           continue;
         }
@@ -933,16 +1011,13 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
 
       if (intr == 0x10 && fn == 0x00)
         {
-          if (!al_known || bios_video_mode_needs_console_lock (al))
+          if (!al_known || bios_video_mode_is_graphics (al))
             {
-              stats->direct_video_output = 1;
-              stats->bios_keyboard_input = 1;
+              record_unsupported (stats, (uint32_t) i, intr, 1, fn);
+              stats->graphics_output = 1;
+              i += insn_len;
+              continue;
             }
-        }
-      else if (intr == 0x10 && fn == 0x30)
-        {
-          stats->direct_video_output = 1;
-          stats->bios_keyboard_input = 1;
         }
 
       if (stubs[sbank][fn] == UINT32_MAX)
@@ -950,7 +1025,7 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
           size_t stub_off = text->len;
           if (!emit_stub_for_interrupt (text, intr, fn, rt))
             {
-              if (intr == 0x10 || intr == 0x16 || intr == 0x1a || intr == 0x33)
+              if (intr == 0x16 || intr == 0x33)
                 {
                   i += insn_len;
                   continue;
@@ -981,8 +1056,9 @@ patch_dos_io (struct byte_vec *text, struct patch_stats *stats,
       stats->patched++;
       if (intr == 0x16 || (intr == 0x21 && dos_keyboard_function (fn)))
         stats->bios_keyboard_input = 1;
-      if (intr == 0x10 && fn != 0x00)
-        stats->direct_video_output = 1;
+      if (intr == 0x10 && fn != 0x00 && fn != 0x0e
+          && fn != 0x0f && fn != 0x12 && fn != 0x1a && fn != 0x30)
+        stats->graphics_output = 1;
       i += insn_len;
     }
 

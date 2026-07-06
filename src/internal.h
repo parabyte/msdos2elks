@@ -62,12 +62,17 @@
 #define ELKS_MAX16          0xffffu
 #define ELKS_MAX_HEAP       0xfff0u
 #define ELKS_DEFAULT_STACK  4096u
+#define ELKS_DEFAULT_HEAP   4096u
 #define ELKS_DOSISH_STACK   8192u
 #define COM_DEFAULT_BSS     32768u
-#define NE_ARG_SLACK        512u
+#define RUNTIME_STATE_SIZE  529u
+#define ELKS_ARG_SLACK      512u
+#define NE_ARG_SLACK        ELKS_ARG_SLACK
 
 #define MZ_MAGIC            0x5a4du
 #define ZM_MAGIC            0x4d5au
+
+#define UNSUPPORTED_RAW_VIDEO_MEMORY 0xfeu
 
 struct byte_vec
 {
@@ -159,7 +164,7 @@ struct unsupported_site
 {
   uint32_t offset;
   uint8_t intr;
-  uint8_t fn;
+  uint16_t fn;
   int known;
 };
 
@@ -171,7 +176,7 @@ struct patch_stats
   int dynamic_int21;
   int dynamic_int16;
   int bios_keyboard_input;
-  int direct_video_output;
+  int graphics_output;
   unsigned com_segfix;
   unsigned stackfix;
   struct unsupported_site first[16];
@@ -242,7 +247,7 @@ void vec_append_zeros (struct byte_vec *v, size_t len);
 void emit8 (struct byte_vec *v, uint8_t b);
 void emit16 (struct byte_vec *v, uint16_t w);
 void emit32 (struct byte_vec *v, uint32_t l);
-int bios_video_mode_needs_console_lock (uint8_t mode);
+int bios_video_mode_is_graphics (uint8_t mode);
 void reloc_add (struct reloc_vec *v, uint32_t addr, uint16_t sym);
 void ne_reloc_add (struct ne_reloc_vec *v, uint16_t src_chain,
                    uint8_t src_type, uint8_t flags, uint8_t segment,
@@ -272,10 +277,12 @@ void patch_mz_stack_setup (struct byte_vec *text,
                            struct patch_stats *stats);
 void patch_dos_stack_switches (struct byte_vec *text,
                                struct patch_stats *stats);
+void patch_com_stack_pointer_setup (struct byte_vec *text,
+                                    struct patch_stats *stats);
 void append_com_argv_startup (struct image *img, int install_int21,
                               uint16_t int21_handler,
                               const struct runtime_info *rt,
-                              int raw_keyboard, int direct_video,
+                              int raw_keyboard, int graphics_output,
                               int install_int16, uint16_t int16_handler,
                               int startup_video_mode_set,
                               uint8_t startup_video_mode);
@@ -284,7 +291,7 @@ void install_com_return_exit (struct image *img,
 void append_mz_argv_startup (struct image *img, uint16_t original_entry,
                              int install_int21, uint16_t int21_handler,
                              const struct runtime_info *rt,
-                             int raw_keyboard, int direct_video,
+                             int raw_keyboard, int graphics_output,
                              int install_int16, uint16_t int16_handler,
                              int startup_video_mode_set,
                              uint8_t startup_video_mode);
@@ -310,8 +317,6 @@ void emit_exit_stub (struct byte_vec *v, int use_al,
                      const struct runtime_info *rt);
 int emit_bios_keyboard_stub_for_fn (struct byte_vec *v, uint8_t fn,
                                     const struct runtime_info *rt);
-uint16_t emit_bios_dynamic_video_stub (struct byte_vec *v,
-                                       const struct runtime_info *rt);
 int emit_stub_for_interrupt (struct byte_vec *v, uint8_t intr, uint8_t fn,
                              const struct runtime_info *rt);
 uint16_t append_int21_interrupt_handler (struct byte_vec *text,

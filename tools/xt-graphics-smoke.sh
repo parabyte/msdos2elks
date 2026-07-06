@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# Generate and convert 100 tiny XT-era DOS graphics smoke programs.
+# Generate 100 tiny XT-era DOS graphics negative-smoke programs.
 #
 # These are plain COM programs built from 8086-compatible instruction bytes.
-# Each one selects an XT-era BIOS display mode, draws through INT 10h or the
-# legacy CGA/MDA display aperture, pauses using the BIOS clock, and exits
-# through DOS INT 21h.  That shape is deliberate: a runtime ELKS/QEMU smoke
-# test can launch one program, capture the visible graphics state, and then
-# verify that the ELKS console returns to text mode without depending on
-# host keyboard injection timing.
+# Each one selects an XT-era BIOS display mode or uses a BIOS graphics service.
+# Standard ELKS does not expose a kernel pixel API for these operations, and
+# converted DOS programs must not pass through to ROM BIOS or raw video memory.
+# This smoke therefore expects strict conversion to reject every case.
 
 set -euo pipefail
 
@@ -108,22 +106,6 @@ sub get_mode {
   return bytes (0xb4, 0x0f, 0xcd, 0x10);
 }
 
-sub direct_cga_word {
-  my ($offset, $value) = @_;
-  return bytes (0xb8) . word (0xb800) .
-         bytes (0x8e, 0xc0, 0xbf) . word ($offset) .
-         bytes (0xb8) . word ($value) .
-         bytes (0xab);
-}
-
-sub direct_mda_word {
-  my ($offset, $value) = @_;
-  return bytes (0xb8) . word (0xb000) .
-         bytes (0x8e, 0xc0, 0xbf) . word ($offset) .
-         bytes (0xb8) . word ($value) .
-         bytes (0xab);
-}
-
 sub marker {
   my ($n) = @_;
   return tty ('G', 2) . tty (chr (ord ('0') + (($n / 10) % 10)), 3) .
@@ -178,11 +160,13 @@ for my $i (0 .. 19) {
 }
 
 for my $i (0 .. 14) {
-  my $off = ($i * 160) & 0x1ffe;
-  my $val = 0x1111 | (($i & 3) << 8);
-  add ("cga_mem_$i",
-       mode (0x04) . direct_cga_word ($off, $val) .
-       direct_cga_word ($off + 2, $val ^ 0x3333) . pause_exit ());
+  my $x = 12 + ($i * 13);
+  my $y = 24 + ($i * 7);
+  add ("cga_bios_$i",
+       mode (0x04) . marker ($i) .
+       pixel (($i & 3) + 1, $x, $y) .
+       pixel ((($i + 1) & 3) + 1, $x + 4, $y + 2) .
+       pause_exit ());
 }
 
 for my $i (0 .. 14) {
@@ -195,9 +179,10 @@ for my $i (0 .. 14) {
 }
 
 for my $i (0 .. 9) {
+  my $row = $i % 10;
+  my $col = ($i * 7) % 60;
   add ("mda_text_$i",
-       mode (0x07) . direct_mda_word (($i * 160) & 0x0ffe,
-                                      0x0700 | ord ('M')) .
+       mode (0x07) . cursor ($row, $col) . write_char ('M', 0x07, 3) .
        get_mode () . pause_exit ());
 }
 
@@ -235,13 +220,14 @@ for input in "$root"/dos-com/G*.COM; do
   output=$root/elks-com/$name
   log=$root/log/com-$name.log
   com_count=$((com_count + 1))
-  if ! "$converter" --verbose "$input" "$output" > "$log" 2>&1; then
-    printf 'xt-graphics-smoke: COM conversion failed for %s\n' "$name" >&2
+  if "$converter" --verbose "$input" "$output" > "$log" 2>&1; then
+    printf 'xt-graphics-smoke: COM graphics input unexpectedly converted: %s\n' \
+      "$name" >&2
     cat "$log" >&2
     exit 1
   fi
-  if [ ! -s "$output" ]; then
-    printf 'xt-graphics-smoke: converter wrote empty COM output for %s\n' \
+  if ! grep -q 'unsupported int 10h' "$log"; then
+    printf 'xt-graphics-smoke: COM rejection did not report int 10h: %s\n' \
       "$name" >&2
     cat "$log" >&2
     exit 1
@@ -254,14 +240,15 @@ for input in "$root"/dos-exe/G*.EXE; do
   output=$root/elks-exe/$name
   log=$root/log/exe-$name.log
   exe_count=$((exe_count + 1))
-  if ! "$converter" --verbose --mz-output=auto "$input" "$output" \
+  if "$converter" --verbose --mz-output=auto "$input" "$output" \
        > "$log" 2>&1; then
-    printf 'xt-graphics-smoke: EXE conversion failed for %s\n' "$name" >&2
+    printf 'xt-graphics-smoke: EXE graphics input unexpectedly converted: %s\n' \
+      "$name" >&2
     cat "$log" >&2
     exit 1
   fi
-  if [ ! -s "$output" ]; then
-    printf 'xt-graphics-smoke: converter wrote empty EXE output for %s\n' \
+  if ! grep -q 'unsupported int 10h' "$log"; then
+    printf 'xt-graphics-smoke: EXE rejection did not report int 10h: %s\n' \
       "$name" >&2
     cat "$log" >&2
     exit 1
@@ -269,12 +256,12 @@ for input in "$root"/dos-exe/G*.EXE; do
 done
 
 if [ "$com_count" -ne 100 ] || [ "$exe_count" -ne 100 ]; then
-  printf 'xt-graphics-smoke: converted %u COM and %u EXE cases, expected 100 each\n' \
+  printf 'xt-graphics-smoke: checked %u COM and %u EXE cases, expected 100 each\n' \
     "$com_count" "$exe_count" >&2
   exit 1
 fi
 
-printf 'xt-graphics-smoke: converted %u COM and %u MZ EXE XT-era graphics programs' \
+printf 'xt-graphics-smoke: rejected %u COM and %u MZ EXE BIOS graphics programs' \
   "$com_count" "$exe_count"
 if [ -n "$keep_dir" ]; then
   printf ' into %s\n' "$root"

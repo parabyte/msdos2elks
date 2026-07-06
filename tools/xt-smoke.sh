@@ -5,7 +5,10 @@
 # compressed, archived, self-extracting, or title-specific game binaries.
 # Each case exercises a statically recognizable interrupt surface that a real
 # early DOS utility, installer, text tool, setup program, or simple game might
-# use.  The smoke test proves host-side rewriting and output generation; it
+# use.  The suite only includes surfaces that strict conversion can route
+# through ELKS syscalls/ioctls or deterministic non-hardware stubs.  BIOS
+# graphics, raw video memory, and dynamic video helpers belong in the negative
+# graphics smoke.  This host test proves rewriting and output generation; it
 # does not replace booting the converted programs inside ELKS on the target
 # machine.
 
@@ -70,14 +73,19 @@ do
   add_case "dos21_${fn}" "b4${fn}cd21${exit_dos}"
 done
 
-for ax in 0000 0001 0002 0003 0004 0005 0006 0007 000d 000e 000f 0010 0013
+for ax in 0000 0001 0002 0003 0007 0080 0081 0082 0083 0087
 do
-  add_case "bios10_mode_${ax}" "b8${ax:2:2}${ax:0:2}cd10${exit_dos}"
+  add_case "bios10_textmode_${ax}" "b8${ax:2:2}${ax:0:2}cd10${exit_dos}"
 done
 
-for fn in 01 02 03 08 09 0e 0f 12 1a 30
+for fn in 0e 0f 12 1a 30
 do
   add_case "bios10_ah_${fn}" "b4${fn}cd10${exit_dos}"
+done
+
+for ch in 41 42 43 44 45 46 47 48 49 4a 4b
+do
+  add_case "bios10_teletype_${ch}" "b0${ch}b40ecd10${exit_dos}"
 done
 
 for fn in 00 01 02 10 11 12
@@ -85,7 +93,7 @@ do
   add_case "bios16_${fn}" "b4${fn}cd16${exit_dos}"
 done
 
-for fn in 00 01 02 04
+for fn in 00
 do
   add_case "bios1a_${fn}" "b4${fn}cd1a${exit_dos}"
 done

@@ -4,17 +4,29 @@ static void
 check_image_limits (const struct image *img)
 {
   uint32_t base;
+  uint32_t heap_reserve;
 
   if (img->text.len == 0 || img->text.len > ELKS_MAX16)
     die ("ELKS text segment size is invalid");
   if (img->data.len > ELKS_MAX16)
     die ("ELKS data segment size is too large");
 
-  base = (uint32_t) img->data.len + img->bss + img->stack;
+  /*
+   * ELKS places the exec argument/environment copy near the initial user
+   * stack.  Keep a small fixed slack area in the accounting so large converted
+   * DOS tools can still start with normal command-line arguments instead of
+   * failing in exec before the program entry point is reached.
+   */
+  base = (uint32_t) img->data.len + img->bss + img->stack + ELKS_ARG_SLACK;
   if (base > ELKS_MAX_HEAP)
-    die ("ELKS data+bss+stack memory exceeds the 16-bit segment limit");
-  if (img->heap != 0 && img->heap < ELKS_MAX_HEAP
-      && base + img->heap > ELKS_MAX_HEAP)
+    die ("ELKS data+bss+stack+argv memory exceeds the 16-bit segment limit");
+  if (img->heap == 0)
+    heap_reserve = ELKS_DEFAULT_HEAP;
+  else if (img->heap < ELKS_MAX_HEAP)
+    heap_reserve = img->heap;
+  else
+    heap_reserve = 0;
+  if (heap_reserve && base + heap_reserve > ELKS_MAX_HEAP)
     die ("ELKS data+bss+stack+heap memory exceeds the 16-bit segment limit");
 }
 

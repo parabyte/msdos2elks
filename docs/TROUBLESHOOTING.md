@@ -33,19 +33,19 @@ Host conversion does not prove graphical correctness.  Run the program inside
 the ELKS target environment with the target video mode and inspect the real
 display output.
 
-If the program relies on direct CGA/EGA/VGA memory access, the target ELKS
-configuration and hardware must expose that video memory in a way the process
-can use.  Converted programs that set a BIOS graphics mode through a rewritten
-`int 10h` call ask ELKS to stop console painting before the BIOS mode switch,
-then restore a text mode and release the console lock on exit.  Programs that
-switch hardware without a recognizable BIOS mode-set call may still need
-target-side validation.
+Strict conversion now refuses graphics paths that cannot go through the ELKS
+kernel.  Direct `A000h`, `B000h`, or `B800h` video-memory setup is reported as
+unsupported, and BIOS graphics mode changes, palette changes, pixel
+reads/writes, cursor/page/scroll services, and dynamic `int 10h` helpers are
+also rejected.  A successful conversion should not contain a ROM BIOS video
+interrupt or a raw video-memory drawing path.
 
 Legacy graphics libraries can misdetect a VGA BIOS and then select a memory
 layout that does not match the code bundled with the program.  The converter
 therefore reports no useful EGA/VGA/MCGA adapter information for static
-discovery queries, while still allowing explicit BIOS mode-set calls and direct
-video memory writes.
+discovery queries.  If a program still needs pixel graphics, ELKS needs a
+kernel graphics interface that the converter can target; adding a title-specific
+BIOS or raw-memory escape is intentionally not supported.
 
 ## `text or data segment too large`
 

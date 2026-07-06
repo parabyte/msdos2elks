@@ -26,6 +26,8 @@ Environment:
   ELKS_SMOKE_KEY_DELAY=0.25    seconds between injected keys
   ELKS_SMOKE_POST_KEY_DELAY=0.6
                               seconds to wait before the shell done marker
+  ELKS_SMOKE_ERROR_PATTERN='not found|No such file|Permission denied|Exec format|Segmentation|Killed|panic|Oops'
+                              grep -Eai pattern treated as infrastructure crash
   ELKS_SMOKE_QEMU=qemu-system-i386
 EOF
   exit 2
@@ -49,6 +51,7 @@ smoke_keys=${ELKS_SMOKE_KEYS:-'ret spc a ret'}
 smoke_key_delay=${ELKS_SMOKE_KEY_DELAY:-0.25}
 smoke_post_key_delay=${ELKS_SMOKE_POST_KEY_DELAY:-0.6}
 qemu=${ELKS_SMOKE_QEMU:-qemu-system-i386}
+error_pattern=${ELKS_SMOKE_ERROR_PATTERN:-'not found|No such file|Permission denied|Exec format|Segmentation|Killed|panic|Oops'}
 
 if [ ! -f "$boot_image" ]; then
   printf 'elks-runtime-smoke: boot image not found: %s\n' "$boot_image" >&2
@@ -289,9 +292,8 @@ check_serial_errors()
 
   tail -c +"$((offset + 1))" "$serial_log" > "$chunk"
 
-  if grep -Eai \
-      'not found|No such file|Permission denied|Exec format|Segmentation|Killed|panic|Oops' \
-      "$chunk" >/dev/null 2>&1; then
+  if [ -n "$error_pattern" ] \
+     && grep -Eai "$error_pattern" "$chunk" >/dev/null 2>&1; then
     printf 'elks-runtime-smoke: serial error while running %s\n' "$label" >&2
     cat "$chunk" >&2
     return 1

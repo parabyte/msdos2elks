@@ -22,6 +22,8 @@ Environment:
   ELKS_SMOKE_START=1           first numeric program id to run
   ELKS_SMOKE_TIMEOUT=25        seconds to wait for each program to return
   ELKS_SMOKE_ALLOW_TIMEOUT=0   treat timeout after launch as interactive success
+  ELKS_SMOKE_CONTINUE_ON_FAILURE=0
+                              keep running later cases and write status.tsv
 EOF
   exit 2
 }
@@ -40,10 +42,12 @@ allow_timeout=${ELKS_SMOKE_ALLOW_TIMEOUT:-0}
 app_dir=${ELKS_SMOKE_APP_DIR:-exe}
 case_subdir=${ELKS_SMOKE_CASE_SUBDIR:-0}
 program_name=${ELKS_SMOKE_PROGRAM:-run}
+continue_on_failure=${ELKS_SMOKE_CONTINUE_ON_FAILURE:-0}
 
 mkdir -p "$out_dir"
 out_dir=$(cd "$out_dir" && pwd)
 summary=$out_dir/summary.tsv
+status=$out_dir/status.tsv
 run_log=$out_dir/run.log
 
 touch "$run_log"
@@ -51,24 +55,36 @@ if [ ! -s "$summary" ]; then
   printf 'case\tphase\twidth\theight\tmaxval\tnonblack_pixels\tunique_colors\tfile\n' \
     > "$summary"
 fi
+if [ ! -s "$status" ]; then
+  printf 'case\tstatus\n' > "$status"
+fi
 
 case_id=$case_start
 case_end=$((case_start + case_count - 1))
+failures=0
 
 while [ "$case_id" -le "$case_end" ]; do
   case_name=$(printf 'G%03u' "$case_id")
   case_out=$out_dir/$case_name
 
   printf 'batch run %s/%s\n' "$app_dir" "$case_name" | tee -a "$run_log"
-  ELKS_SMOKE_APP_DIR=$app_dir \
-  ELKS_SMOKE_COUNT=1 \
-  ELKS_SMOKE_START=$case_id \
-  ELKS_SMOKE_TIMEOUT=$case_timeout \
-  ELKS_SMOKE_ALLOW_TIMEOUT=$allow_timeout \
-  ELKS_SMOKE_CASE_SUBDIR=$case_subdir \
-  ELKS_SMOKE_PROGRAM=$program_name \
-    "$(dirname "$0")/elks-runtime-smoke.sh" \
-      "$boot_image" "$app_image" "$case_out" | tee -a "$run_log"
+  if ELKS_SMOKE_APP_DIR=$app_dir \
+      ELKS_SMOKE_COUNT=1 \
+      ELKS_SMOKE_START=$case_id \
+      ELKS_SMOKE_TIMEOUT=$case_timeout \
+      ELKS_SMOKE_ALLOW_TIMEOUT=$allow_timeout \
+      ELKS_SMOKE_CASE_SUBDIR=$case_subdir \
+      ELKS_SMOKE_PROGRAM=$program_name \
+        "$(dirname "$0")/elks-runtime-smoke.sh" \
+          "$boot_image" "$app_image" "$case_out" | tee -a "$run_log"; then
+    printf '%s\tok\n' "$case_name" >> "$status"
+  else
+    printf '%s\tfail\n' "$case_name" >> "$status"
+    failures=$((failures + 1))
+    if [ "$continue_on_failure" != 1 ]; then
+      exit 1
+    fi
+  fi
 
   if [ -f "$case_out/summary.tsv" ]; then
     tail -n +2 "$case_out/summary.tsv" >> "$summary"
@@ -77,5 +93,9 @@ while [ "$case_id" -le "$case_end" ]; do
   case_id=$((case_id + 1))
 done
 
-printf 'elks-runtime-batch: ran %u isolated apps, output=%s\n' \
-  "$case_count" "$out_dir"
+printf 'elks-runtime-batch: ran %u isolated apps, failures=%u, output=%s\n' \
+  "$case_count" "$failures" "$out_dir"
+
+if [ "$failures" -ne 0 ]; then
+  exit 1
+fi

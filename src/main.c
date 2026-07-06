@@ -53,27 +53,27 @@ main (int argc, char **argv)
         fprintf (stderr,
                  "msdos2elks: patched=%u unsupported=%u dynamic-int21=%u"
                  " dynamic-int10=%u dynamic-int16=%u bios-keyboard=%u"
-                 " direct-video=%u com-segment-fixes=%u stack-fixes=%u"
+                 " graphics-output=%u com-segment-fixes=%u stack-fixes=%u"
                  " os2-ne-segs=%u\n",
                  stats.patched, stats.unsupported,
                  stats.dynamic_int21 ? 1u : 0u,
                  stats.dynamic_int10 ? 1u : 0u,
                  stats.dynamic_int16 ? 1u : 0u,
                  stats.bios_keyboard_input ? 1u : 0u,
-                 stats.direct_video_output ? 1u : 0u,
+                 stats.graphics_output ? 1u : 0u,
                  stats.com_segfix, stats.stackfix, img.ne_nsegs);
       else
         fprintf (stderr,
                  "msdos2elks: patched=%u unsupported=%u dynamic-int21=%u"
                  " dynamic-int10=%u dynamic-int16=%u bios-keyboard=%u"
-                 " direct-video=%u com-segment-fixes=%u stack-fixes=%u"
+                 " graphics-output=%u com-segment-fixes=%u stack-fixes=%u"
                  " text=%u data=%u trel=%u drel=%u\n",
                  stats.patched, stats.unsupported,
                  stats.dynamic_int21 ? 1u : 0u,
                  stats.dynamic_int10 ? 1u : 0u,
                  stats.dynamic_int16 ? 1u : 0u,
                  stats.bios_keyboard_input ? 1u : 0u,
-                 stats.direct_video_output ? 1u : 0u,
+                 stats.graphics_output ? 1u : 0u,
                  stats.com_segfix, stats.stackfix,
                  (unsigned) img.text.len, (unsigned) img.data.len,
                  (unsigned) img.trel.len, (unsigned) img.drel.len);

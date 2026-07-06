@@ -152,11 +152,154 @@ patch_dos_stack_switches (struct byte_vec *text, struct patch_stats *stats)
     }
 }
 
+static int
+is_com_top_of_memory_stack_setup (const struct byte_vec *text, size_t movsp)
+{
+  size_t start;
+  size_t j;
+
+  /*
+   * Microsoft-style COM C runtimes read the PSP top-of-memory word, add a
+   * private stack allowance, then jump to a plain "mov sp,bx" when the 16-bit
+   * add did not carry.  That is correct in DOS because CS, DS, ES, and SS all
+   * name the same 64 KiB program segment.  In the converted ELKS process the
+   * startup code has already built the real user stack and the exit return
+   * frame, so moving SP to the DOS top-of-memory value loses that frame.
+   *
+   * Keep this recognizer narrow: require the nearby "mov bx,imm16",
+   * "add bx,imm", and "jae mov_sp" shape, plus an SS: bookkeeping store just
+   * after the stack assignment.  The replacement is two 8086 NOP bytes.
+   */
+  start = movsp > 40u ? movsp - 40u : COM_ORG;
+  for (j = start; j + 2u < movsp; j++)
+    {
+      size_t k;
+
+      if (text->data[j] != 0xbb)        /* mov bx, imm16 */
+        continue;
+
+      for (k = j + 3u; k + 1u < movsp; k++)
+        {
+          size_t branch;
+
+          if (!((k + 3u < movsp && text->data[k] == 0x81
+                 && text->data[k + 1u] == 0xc3)
+                || (k + 2u < movsp && text->data[k] == 0x83
+                    && text->data[k + 1u] == 0xc3)))
+            continue;                   /* add bx, imm16/imm8 */
+
+          for (branch = k + 2u; branch + 1u < movsp; branch++)
+            {
+              uint8_t rel;
+              size_t target;
+
+              if (text->data[branch] != 0x73)
+                continue;               /* jae rel8 */
+              rel = text->data[branch + 1u];
+              target = branch + 2u + (size_t) rel;
+              if (target == movsp)
+                {
+                  size_t ssend;
+                  size_t ss;
+
+                  ssend = movsp + 24u < text->len ? movsp + 24u : text->len;
+                  for (ss = movsp + 2u; ss + 1u < ssend; ss++)
+                    if (text->data[ss] == 0x36
+                        && (text->data[ss + 1u] == 0xa3
+                            || text->data[ss + 1u] == 0x89
+                            || text->data[ss + 1u] == 0x8c))
+                      return 1;
+                }
+            }
+        }
+    }
+
+  return 0;
+}
+
+static int
+is_com_cs_stack_segment_setup (const struct byte_vec *text, size_t movss)
+{
+  uint8_t reg;
+  size_t start;
+  size_t j;
+  int saw_cs_to_reg = 0;
+  int saw_bx_base = 0;
+  int saw_round = 0;
+
+  /*
+   * Some 8086 COM C runtimes do not wrap their stack switch in CLI/STI.
+   * Instead they copy CS into a general register, compute a paragraph-aligned
+   * top-of-memory stack address in BX, then execute:
+   *
+   *   mov ss, reg
+   *   mov sp, bx
+   *
+   * That is a valid DOS COM startup sequence because code, data, and stack
+   * all share one 64 KiB segment.  It is not valid after conversion: ELKS has
+   * already provided the native user stack, and CS names the read-only text
+   * segment rather than the data/stack segment.  Keep the recognizer narrow by
+   * requiring the nearby "mov reg,cs", a BX base load, and the usual
+   * "and bl,0f0h" paragraph rounding before removing the four stack-switch
+   * bytes.  The replacement uses only single-byte 8086 NOP instructions.
+   */
+  if (movss + 3u >= text->len || text->data[movss] != 0x8e
+      || (text->data[movss + 1u] & 0xf8u) != 0xd0u
+      || text->data[movss + 2u] != 0x8b
+      || text->data[movss + 3u] != 0xe3)
+    return 0;
+
+  reg = (uint8_t) (text->data[movss + 1u] & 7u);
+  start = movss > 80u ? movss - 80u : COM_ORG;
+  for (j = start; j + 1u < movss; j++)
+    {
+      if (text->data[j] == 0x8c
+          && text->data[j + 1u] == (uint8_t) (0xc8u | reg))
+        saw_cs_to_reg = 1;              /* mov reg, cs */
+      else if (text->data[j] == 0xbb)
+        saw_bx_base = 1;                /* mov bx, imm16 */
+      else if (j + 2u < movss && text->data[j] == 0x80
+               && text->data[j + 1u] == 0xe3
+               && text->data[j + 2u] == 0xf0)
+        saw_round = 1;                  /* and bl, 0f0h */
+    }
+
+  return saw_cs_to_reg && saw_bx_base && saw_round;
+}
+
+void
+patch_com_stack_pointer_setup (struct byte_vec *text,
+                               struct patch_stats *stats)
+{
+  size_t i;
+
+  for (i = COM_ORG; i + 1u < text->len; i++)
+    {
+      if (i + 3u < text->len && is_com_cs_stack_segment_setup (text, i))
+        {
+          memset (text->data + i, 0x90, 4u);
+          stats->stackfix++;
+          i += 3u;
+          continue;
+        }
+
+      if (text->data[i] != 0x8b || text->data[i + 1u] != 0xe3)
+        continue;                       /* mov sp, bx */
+      if (!is_com_top_of_memory_stack_setup (text, i))
+        continue;
+
+      text->data[i] = 0x90;
+      text->data[i + 1u] = 0x90;
+      stats->stackfix++;
+      i++;
+    }
+}
+
 void
 append_com_argv_startup (struct image *img, int install_int21,
                          uint16_t int21_handler,
                          const struct runtime_info *rt, int raw_keyboard,
-                         int direct_video, int install_int16,
+                         int graphics_output, int install_int16,
                          uint16_t int16_handler,
                          int startup_video_mode_set,
                          uint8_t startup_video_mode)
@@ -173,6 +316,7 @@ append_com_argv_startup (struct image *img, int install_int21,
     0x06,                   /* push es */
     0x1e,                   /* push ds */
     0x07,                   /* pop es; stosb writes the PSP in data */
+    0x8c, 0x1e, 0x36, 0x00, /* mov [0036h], ds; PSP JFT pointer segment */
     0xbf, 0x81, 0x00,       /* mov di, 0081h */
     0x31, 0xc9,             /* xor cx, cx */
     0x8b, 0x56, 0x02,       /* mov dx, [bp+2]; argc */
@@ -226,13 +370,13 @@ append_com_argv_startup (struct image *img, int install_int21,
   if (install_int16)
     emit_install_int16_vector (&img->text, int16_handler);
   vec_append (&img->text, prefix, sizeof (prefix));
-  if (direct_video)
+  if (graphics_output)
     emit_save_initial_video_mode (&img->text, rt);
-  if (raw_keyboard || direct_video)
+  if (raw_keyboard || graphics_output)
     emit_stdin_raw_mode (&img->text, rt);
-  if (direct_video && startup_video_mode_set)
+  if (graphics_output && startup_video_mode_set)
     emit_startup_video_mode (&img->text, rt, startup_video_mode);
-  else if (direct_video)
+  else if (graphics_output)
     emit_claim_console_video (&img->text, rt);
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding COM argv startup");
@@ -265,7 +409,7 @@ void
 append_mz_argv_startup (struct image *img, uint16_t original_entry,
                         int install_int21, uint16_t int21_handler,
                         const struct runtime_info *rt, int raw_keyboard,
-                        int direct_video, int install_int16,
+                        int graphics_output, int install_int16,
                         uint16_t int16_handler,
                         int startup_video_mode_set,
                         uint8_t startup_video_mode)
@@ -335,13 +479,13 @@ append_mz_argv_startup (struct image *img, uint16_t original_entry,
   if (install_int16)
     emit_install_int16_vector (&img->text, int16_handler);
   vec_append (&img->text, prefix, sizeof (prefix));
-  if (direct_video)
+  if (graphics_output)
     emit_save_initial_video_mode (&img->text, rt);
-  if (raw_keyboard || direct_video)
+  if (raw_keyboard || graphics_output)
     emit_stdin_raw_mode (&img->text, rt);
-  if (direct_video && startup_video_mode_set)
+  if (graphics_output && startup_video_mode_set)
     emit_startup_video_mode (&img->text, rt, startup_video_mode);
-  else if (direct_video)
+  else if (graphics_output)
     emit_claim_console_video (&img->text, rt);
   if (start > ELKS_MAX16 || img->text.len + 3u > ELKS_MAX16)
     die ("text segment grew beyond 64 KiB while adding MZ argv startup");
@@ -376,7 +520,7 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
   uint16_t next_para;
   uint16_t limit_para;
 
-  if (data->len + 529u > ELKS_MAX16)
+  if (data->len + RUNTIME_STATE_SIZE > ELKS_MAX16)
     die ("data segment is too large for converter runtime state");
 
   rt->heap_next_off = (uint16_t) data->len;
@@ -389,7 +533,7 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
   rt->keyboard_mode_off = (uint16_t) (data->len + 12u);
   rt->keyboard_pending_off = (uint16_t) (data->len + 14u);
   rt->io_buf_off = (uint16_t) (data->len + 16u);
-  rt->media_id_off = (uint16_t) (data->len + 528u);
+  rt->media_id_off = (uint16_t) (data->len + RUNTIME_STATE_SIZE - 1u);
   emit16 (data, 0);
   emit16 (data, 0);
   emit16 (data, 0x80);
@@ -413,7 +557,7 @@ append_runtime_state_to_data (struct byte_vec *data, uint16_t heap,
     }
   else
     {
-      uint32_t heap_bytes = heap ? heap : 4096u;
+      uint32_t heap_bytes = heap ? heap : ELKS_DEFAULT_HEAP;
       limit_bytes = runtime_end + bss + heap_bytes;
     }
 

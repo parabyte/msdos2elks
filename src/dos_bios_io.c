@@ -27,6 +27,95 @@ emit_pushpop_dx_bx (struct byte_vec *v)
 }
 
 static void
+emit_normalize_dos_path_in_place (struct byte_vec *v)
+{
+  size_t loop;
+  size_t done_rel;
+  size_t slash_low_rel;
+  size_t slash_high_rel;
+  size_t lower_loop_rel;
+  size_t slash;
+  size_t slash_loop_rel;
+  size_t store_loop_rel;
+  size_t done;
+
+  /*
+   * DOS path matching is case-insensitive and uses '\' as its separator.
+   * The ELKS FAT mount used by the smoke tests exposes names in lowercase and
+   * accepts POSIX-style '/'.  Normalize the caller's ASCIIZ path in place
+   * before entering the kernel.  This is intentionally byte-oriented 8086
+   * code: no tables, no multiplication, and no wider temporaries.
+   */
+  emit8 (v, 0x56);          /* push si */
+  emit8 (v, 0x89);
+  emit8 (v, 0xd6);          /* si = dx */
+
+  loop = v->len;
+  emit8 (v, 0xac);          /* lodsb */
+  emit8 (v, 0x08);
+  emit8 (v, 0xc0);          /* or al, al */
+  emit8 (v, 0x74);
+  done_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 'A');           /* cmp al, 'A' */
+  emit8 (v, 0x72);
+  slash_low_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x3c);
+  emit8 (v, 'Z');           /* cmp al, 'Z' */
+  emit8 (v, 0x77);
+  slash_high_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x80);
+  emit8 (v, 0x4c);
+  emit8 (v, 0xff);
+  emit8 (v, 0x20);          /* or byte [si-1], 20h */
+  emit8 (v, 0xeb);
+  lower_loop_rel = v->len;
+  emit8 (v, 0);
+
+  slash = v->len;
+  emit8 (v, 0x3c);
+  emit8 (v, '\\');          /* cmp al, '\' */
+  emit8 (v, 0x75);
+  slash_loop_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0xc6);
+  emit8 (v, 0x44);
+  emit8 (v, 0xff);
+  emit8 (v, '/');           /* mov byte [si-1], '/' */
+  emit8 (v, 0xeb);
+  store_loop_rel = v->len;
+  emit8 (v, 0);
+
+  done = v->len;
+  emit8 (v, 0x5e);          /* pop si */
+
+  patch_rel8 (v, done_rel, done);
+  patch_rel8 (v, slash_low_rel, slash);
+  patch_rel8 (v, slash_high_rel, slash);
+  patch_rel8 (v, lower_loop_rel, loop);
+  patch_rel8 (v, slash_loop_rel, loop);
+  patch_rel8 (v, store_loop_rel, loop);
+}
+
+static void
+emit_dx_path_to_bx (struct byte_vec *v)
+{
+  emit_pushpop_dx_bx (v);
+  emit8 (v, 0x80);
+  emit8 (v, 0x7f);
+  emit8 (v, 0x01);
+  emit8 (v, ':');           /* cmp byte [bx+1], ':' */
+  emit8 (v, 0x75);
+  emit8 (v, 0x03);          /* no drive prefix */
+  emit8 (v, 0x83);
+  emit8 (v, 0xc3);
+  emit8 (v, 0x02);          /* skip "C:" */
+}
+
+static void
 emit_save_bx_cx_dx (struct byte_vec *v)
 {
   emit8 (v, 0x53);
@@ -46,7 +135,8 @@ static void
 emit_syscall_path1 (struct byte_vec *v, uint16_t nr)
 {
   emit_save_bx_cx_dx (v);
-  emit_pushpop_dx_bx (v);
+  emit_normalize_dos_path_in_place (v);
+  emit_dx_path_to_bx (v);
   emit8 (v, 0xb8);
   emit16 (v, nr);
   emit8 (v, 0xcd);
@@ -305,6 +395,50 @@ emit_zero_dx_success_stub (struct byte_vec *v)
 }
 
 static void
+emit_ioctl_stub (struct byte_vec *v)
+{
+  /*
+   * DOS INT 21h AX=4400h asks for device information about a file handle.
+   * Small DOS C runtimes use this to decide whether stdout and stderr are
+   * terminals or disk files.  ELKS standard handles 0, 1, and 2 are inherited
+   * from the shell as console streams during these conversions.  Report the
+   * DOS character-device bit plus the standard input/output capability bits:
+   * handle 0 is stdin, handles 1 and 2 are output streams.  Other handles
+   * remain plain disk files, which keeps normal file reads and writes buffered.
+   */
+  emit8 (v, 0x3c);
+  emit8 (v, 0x00);          /* cmp al, 0; get device information */
+  emit8 (v, 0x75);
+  emit8 (v, 0x17);          /* other IOCTL subfunctions: zero success */
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* dx = file */
+  emit8 (v, 0x83);
+  emit8 (v, 0xfb);
+  emit8 (v, 0x03);          /* cmp bx, 3 */
+  emit8 (v, 0x73);
+  emit8 (v, 0x0e);          /* handles 3+ stay disk files */
+  emit8 (v, 0xb2);
+  emit8 (v, 0x80);          /* DOS character-device bit */
+  emit8 (v, 0x09);
+  emit8 (v, 0xdb);          /* or bx, bx */
+  emit8 (v, 0x75);
+  emit8 (v, 0x05);
+  emit8 (v, 0x80);
+  emit8 (v, 0xca);
+  emit8 (v, 0x01);          /* stdin bit */
+  emit8 (v, 0xeb);
+  emit8 (v, 0x03);
+  emit8 (v, 0x80);
+  emit8 (v, 0xca);
+  emit8 (v, 0x02);          /* stdout bit, also useful for stderr */
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* unsupported IOCTL subfunction: dx = 0 */
+  emit_success_stub (v);
+}
+
+static void
 emit_find_fail_stub (struct byte_vec *v)
 {
   emit8 (v, 0xb8);
@@ -325,7 +459,9 @@ emit_set_dta_stub (struct byte_vec *v, const struct runtime_info *rt)
 static void
 emit_find_first_stub (struct byte_vec *v, const struct runtime_info *rt)
 {
-  static const uint8_t prefix[] = {
+  size_t fail_rel;
+  size_t fail_pos;
+  static const uint8_t prefix_head[] = {
     0x53,                   /* push bx */
     0x51,                   /* push cx */
     0x52,                   /* push dx */
@@ -333,7 +469,9 @@ emit_find_first_stub (struct byte_vec *v, const struct runtime_info *rt)
     0x57,                   /* push di */
     0x06,                   /* push es */
     0x1e,                   /* push ds */
-    0x07,                   /* pop es */
+    0x07                    /* pop es */
+  };
+  static const uint8_t prefix_scan[] = {
     0x89, 0xd6,             /* mov si, dx */
     0x89, 0xd3,             /* mov bx, dx */
     0xb9, 0x80, 0x00,       /* scan at most 128 bytes */
@@ -352,8 +490,17 @@ emit_find_first_stub (struct byte_vec *v, const struct runtime_info *rt)
     0xe2, 0xe7              /* loop scan */
   };
   static const uint8_t suffix[] = {
-    0xc7, 0x45, 0x1a, 0x01, 0x00, /* DTA size low word: nonzero */
-    0xc7, 0x45, 0x1c, 0x00, 0x00, /* DTA size high word */
+    /*
+     * DOS places the result metadata in the caller's DTA buffer.  Some C
+     * runtimes implement stat() with find-first and read the attribute byte at
+     * DTA+15h.  Keep these bytes deterministic so uninitialized stack data
+     * cannot make a regular file look like a directory.
+     */
+    0xc6, 0x45, 0x15, 0x00,       /* DTA attribute: normal file */
+    0xc7, 0x45, 0x16, 0x00, 0x60, /* DTA time: 12:00:00 */
+    0xc7, 0x45, 0x18, 0x21, 0x16, /* DTA date: 1991-01-01 */
+    0x89, 0x45, 0x1a,             /* DTA size low word */
+    0x89, 0x55, 0x1c,             /* DTA size high word */
     0x83, 0xc7, 0x1e,       /* add di, 30; DTA filename field */
     0x89, 0xde,             /* mov si, bx */
     0xb9, 0x0d, 0x00,       /* mov cx, 13 */
@@ -374,11 +521,75 @@ emit_find_first_stub (struct byte_vec *v, const struct runtime_info *rt)
     0xc3                    /* ret */
   };
 
-  vec_append (v, prefix, sizeof (prefix));
+  vec_append (v, prefix_head, sizeof (prefix_head));
+  emit_normalize_dos_path_in_place (v);
+  vec_append (v, prefix_scan, sizeof (prefix_scan));
   emit8 (v, 0x8b);
   emit8 (v, 0x3e);
   emit16 (v, rt->dta_off_off);
+
+  /*
+   * Return the actual low 32 bits of the ELKS file size in the DTA.  DOS C
+   * runtimes commonly implement stat() with find-first and later compare the
+   * byte count they read against this field.  Use only 16-bit register pairs:
+   * the ELKS lseek syscall stores the new offset as low/high words on our
+   * stack, and the generated code copies those words directly into the DTA.
+   */
+  emit8 (v, 0x53);          /* keep basename pointer */
+  emit8 (v, 0x57);          /* keep DTA pointer */
+  emit_dx_path_to_bx (v);
+  emit8 (v, 0x31);
+  emit8 (v, 0xc9);          /* cx = O_RDONLY */
+  emit8 (v, 0x31);
+  emit8 (v, 0xd2);          /* mode = 0 */
+  emit8 (v, 0xb8);
+  emit16 (v, 5);            /* open */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x85);
+  emit8 (v, 0xc0);          /* test ax, ax */
+  emit8 (v, 0x78);          /* js fail */
+  fail_rel = v->len;
+  emit8 (v, 0);
+  emit8 (v, 0x89);
+  emit8 (v, 0xc3);          /* bx = fd */
+  emit8 (v, 0x31);
+  emit8 (v, 0xc0);          /* ax = 0 */
+  emit8 (v, 0x50);          /* high offset word */
+  emit8 (v, 0x50);          /* low offset word, sp points here */
+  emit8 (v, 0x89);
+  emit8 (v, 0xe1);          /* cx = sp */
+  emit8 (v, 0xba);
+  emit16 (v, 2);            /* SEEK_END */
+  emit8 (v, 0xb8);
+  emit16 (v, 19);           /* lseek */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0xb8);
+  emit16 (v, 6);            /* close */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x58);          /* ax = low size word */
+  emit8 (v, 0x5a);          /* dx = high size word */
+  emit8 (v, 0x5f);          /* restore DTA pointer */
+  emit8 (v, 0x5b);          /* restore basename pointer */
   vec_append (v, suffix, sizeof (suffix));
+
+  fail_pos = v->len;
+  emit8 (v, 0x5f);          /* discard DTA pointer */
+  emit8 (v, 0x5b);          /* discard basename pointer */
+  emit8 (v, 0x07);          /* restore caller state */
+  emit8 (v, 0x5f);
+  emit8 (v, 0x5e);
+  emit8 (v, 0x5a);
+  emit8 (v, 0x59);
+  emit8 (v, 0x5b);
+  emit8 (v, 0xb8);
+  emit16 (v, 2);            /* file not found */
+  emit8 (v, 0xf9);
+  emit8 (v, 0xc3);
+
+  patch_rel8 (v, fail_rel, fail_pos);
 }
 
 static void
@@ -632,11 +843,12 @@ emit_restore_text_mode_if_needed (struct byte_vec *v,
   size_t done;
 
   /*
-   * The low byte at video_mode_off tracks the DOS program's current BIOS
-   * mode request.  The next byte, video_restore_mode_off, is captured at
-   * startup using INT 10h AH=0Fh.  On exit, restore only after the program
-   * has selected a graphics or adapter-specific mode.  Text modes 00h-03h
-   * and MDA mode 07h are already safe for the ELKS console.
+   * The low byte at video_mode_off tracks the DOS program's current mode
+   * request.  The converter no longer emits ROM BIOS mode changes: all
+   * runtime I/O must go through ELKS syscalls or console ioctls.  This helper
+   * therefore only restores the converter's software mode byte before the
+   * ELKS console graphics lock is released.  DCREL_GRAPH is the kernel-owned
+   * operation that restores the console text screen.
    */
   emit8 (v, 0xa0);
   emit16 (v, rt->video_mode_off);          /* al = current DOS video mode */
@@ -669,9 +881,8 @@ emit_restore_text_mode_if_needed (struct byte_vec *v,
   emit8 (v, 0);
 
   /*
-   * If the startup mode was not a text mode, fall back to 80x25 color text
-   * mode 03h.  That is the most portable BIOS text restore for CGA/EGA/VGA
-   * targets; MDA targets normally report mode 07h above and avoid this path.
+   * If the startup mode was not text, fall back to the conventional 80x25
+   * color-text software value.  This does not touch video hardware.
    */
   emit8 (v, 0xb0);
   emit8 (v, 0x03);                         /* al = fallback text mode */
@@ -681,10 +892,6 @@ emit_restore_text_mode_if_needed (struct byte_vec *v,
   patch_rel8 (v, saved_mda_rel, restore);
   emit8 (v, 0xa2);
   emit16 (v, rt->video_mode_off);          /* runtime now expects text */
-  emit8 (v, 0x30);
-  emit8 (v, 0xe4);                         /* ah = BIOS set-mode function */
-  emit8 (v, 0xcd);
-  emit8 (v, 0x10);
 
   done = v->len;
   patch_rel8 (v, already_text_rel, done);
@@ -696,22 +903,18 @@ emit_save_initial_video_mode (struct byte_vec *v,
                               const struct runtime_info *rt)
 {
   /*
-   * Save the boot/ELKS text mode before the DOS program starts changing
-   * video state.  INT 10h AH=0Fh returns AL=current mode, AH=columns, and
-   * BH=active page.  Preserve the caller registers because this helper runs
-   * inside the generated process startup code.
+   * The startup path must not query the ROM BIOS.  ELKS starts converted
+   * programs on the normal console, so seed the DOS-visible software mode as
+   * 03h, the conventional 80x25 color text mode.  No hardware I/O is done
+   * here; later console ownership changes use ELKS ioctls.
    */
   emit8 (v, 0x50);          /* push ax */
-  emit8 (v, 0x53);          /* push bx */
-  emit8 (v, 0xb4);
-  emit8 (v, 0x0f);          /* BIOS get current video mode */
-  emit8 (v, 0xcd);
-  emit8 (v, 0x10);
+  emit8 (v, 0xb0);
+  emit8 (v, 0x03);          /* al = software text mode */
   emit8 (v, 0xa2);
   emit16 (v, rt->video_restore_mode_off);
   emit8 (v, 0xa2);
   emit16 (v, rt->video_mode_off);
-  emit8 (v, 0x5b);          /* pop bx */
   emit8 (v, 0x58);          /* pop ax */
 }
 
@@ -815,6 +1018,7 @@ static void
 emit_open_stub (struct byte_vec *v)
 {
   emit_save_bx_cx_dx (v);
+  emit_normalize_dos_path_in_place (v);
   emit8 (v, 0xb4);
   emit8 (v, 0x00);          /* ax = al */
   emit8 (v, 0x50);
@@ -822,7 +1026,7 @@ emit_open_stub (struct byte_vec *v)
   emit8 (v, 0x80);
   emit8 (v, 0xe1);
   emit8 (v, 0x03);          /* and cl, 3 */
-  emit_pushpop_dx_bx (v);   /* bx = path */
+  emit_dx_path_to_bx (v);
   emit8 (v, 0xba);
   emit16 (v, 0);            /* mode = 0 */
   emit8 (v, 0xb8);
@@ -837,7 +1041,8 @@ static void
 emit_create_stub (struct byte_vec *v)
 {
   emit_save_bx_cx_dx (v);
-  emit_pushpop_dx_bx (v);
+  emit_normalize_dos_path_in_place (v);
+  emit_dx_path_to_bx (v);
   emit8 (v, 0xb9);
   emit16 (v, 0x0241);       /* O_CREAT | O_TRUNC | O_WRONLY */
   emit8 (v, 0xba);
@@ -1937,28 +2142,22 @@ void
 emit_claim_console_video (struct byte_vec *v, const struct runtime_info *rt)
 {
   /*
-   * DOS programs that use BIOS video services or direct B800h/B000h/A000h
-   * memory need the ELKS console to stop repainting over their screen.  This
-   * is true for text-mode games as well as CGA graphics games: many XT-era
-   * titles draw colored character cells directly in 80x25 text mode.
+   * ELKS owns the visible console.  Converted programs that need exclusive
+   * console state must claim it through ELKS ioctls; they must not switch ROM
+   * BIOS modes or write CGA/MDA/EGA/VGA memory directly.
    *
    * The helper preserves the caller registers and uses only 8088/8086
-   * instructions.  It does not change the BIOS video mode; it only asks ELKS
-   * for direct console ownership and raw keyboard scancodes.
+   * instructions.  It asks ELKS for console ownership and raw keyboard
+   * scancodes, and it does no hardware I/O itself.
    */
   emit_enable_console_raw_scancodes (v, rt);
 }
 
 static void
-emit_bios_set_video_mode_stub (struct byte_vec *v, const struct runtime_info *rt)
+emit_bios_set_text_mode_stub (struct byte_vec *v, const struct runtime_info *rt)
 {
   emit8 (v, 0xa2);
-  emit16 (v, rt->video_mode_off);  /* mov [video_mode], al */
-  emit_enable_console_raw_scancodes (v, rt);
-  emit8 (v, 0xb4);
-  emit8 (v, 0x00);                 /* mov ah, 00h */
-  emit8 (v, 0xcd);
-  emit8 (v, 0x10);                 /* let BIOS switch real hardware */
+  emit16 (v, rt->video_mode_off);  /* remember text mode in software only */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
@@ -1968,52 +2167,68 @@ emit_startup_video_mode (struct byte_vec *v,
                          const struct runtime_info *rt, uint8_t mode)
 {
   /*
-   * Some XT-era games draw directly into the CGA display aperture and never
-   * make a statically visible INT 10h AH=00h mode call after the converter's
-   * startup wrapper.  This optional startup hook lets smoke tests select a
-   * known BIOS mode first while still saving the original ELKS text mode for
-   * the normal exit restore path.
+   * The startup hook is retained only as a software mode seed.  It does not
+   * switch ROM BIOS state.  If a DOS program needs a graphics mode that cannot
+   * be represented by an ELKS kernel graphics API, conversion must reject that
+   * site instead of installing this helper.
    *
-   * The generated code uses only 8088/8086 instructions.  MODE is an 8-bit BIOS
-   * video mode number; no arithmetic is performed, so there is no rounding,
+   * The generated code uses only 8088/8086 instructions.  MODE is an 8-bit
+   * DOS video mode value; no arithmetic is performed, so there is no rounding,
    * scaling, saturation, or overflow behavior at this interface.
+   */
+  emit8 (v, 0x50);          /* push ax */
+  emit8 (v, 0xb0);
+  emit8 (v, mode);          /* al = requested software mode */
+  emit8 (v, 0xa2);
+  emit16 (v, rt->video_mode_off);
+  emit8 (v, 0x58);          /* pop ax */
+}
+
+static void
+emit_bios_teletype_elks_stub (struct byte_vec *v, const struct runtime_info *rt)
+{
+  /*
+   * INT 10h AH=0Eh is teletype output.  Route the character through the ELKS
+   * write syscall on stdout.  Attribute, page, and hardware cursor semantics
+   * are not exposed through the standard ELKS kernel ABI, so this adapter is
+   * intentionally limited to the character stream.  It preserves the caller's
+   * 16-bit registers and uses the runtime I/O byte in DS.
    */
   emit8 (v, 0x50);          /* push ax */
   emit8 (v, 0x53);          /* push bx */
   emit8 (v, 0x51);          /* push cx */
   emit8 (v, 0x52);          /* push dx */
-  emit8 (v, 0xb0);
-  emit8 (v, mode);          /* al = requested BIOS mode */
   emit8 (v, 0xa2);
-  emit16 (v, rt->video_mode_off);
-  emit_enable_console_raw_scancodes (v, rt);
+  emit16 (v, rt->io_buf_off);       /* [io_buf] = AL */
+  emit8 (v, 0xbb);
+  emit16 (v, 1);            /* stdout */
+  emit8 (v, 0xb9);
+  emit16 (v, rt->io_buf_off);
+  emit8 (v, 0xba);
+  emit16 (v, 1);            /* one byte */
   emit8 (v, 0xb8);
-  emit16 (v, (uint16_t) mode);     /* ax = 0000h:mode */
+  emit16 (v, 4);            /* write */
   emit8 (v, 0xcd);
-  emit8 (v, 0x10);                 /* let BIOS switch real hardware */
+  emit8 (v, 0x80);
   emit8 (v, 0x5a);          /* pop dx */
   emit8 (v, 0x59);          /* pop cx */
   emit8 (v, 0x5b);          /* pop bx */
   emit8 (v, 0x58);          /* pop ax */
-}
-
-static void
-emit_bios_video_passthrough_stub (struct byte_vec *v, uint8_t fn)
-{
-  emit8 (v, 0xb4);
-  emit8 (v, fn);
-  emit8 (v, 0xcd);
-  emit8 (v, 0x10);
+  emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
 
 static void
-emit_bios_passthrough_stub (struct byte_vec *v, uint8_t intr, uint8_t fn)
+emit_bios_get_video_mode_stub (struct byte_vec *v,
+                               const struct runtime_info *rt)
 {
+  emit8 (v, 0xa0);
+  emit16 (v, rt->video_mode_off);  /* al = software mode */
   emit8 (v, 0xb4);
-  emit8 (v, fn);
-  emit8 (v, 0xcd);
-  emit8 (v, intr);
+  emit8 (v, 80);                  /* ah = text columns */
+  emit8 (v, 0x30);
+  emit8 (v, 0xff);                /* bh = active page 0 */
+  emit8 (v, 0xf8);
   emit8 (v, 0xc3);
 }
 
@@ -2022,11 +2237,9 @@ emit_bios_no_display_combo_stub (struct byte_vec *v)
 {
   /*
    * INT 10h AH=1Ah is a VGA/MCGA display-combination query.  An
-   * XT-class DOS program that explicitly selects a BIOS video mode is
-   * still allowed to do so, but old graphics libraries often use this
-   * query only to choose between legacy CGA/EGA/MDA code and newer
-   * adapter-specific code.  Report the conservative pre-VGA result so
-   * the program keeps using the broad legacy direct-memory path.
+   * This is a harmless adapter probe, not hardware I/O.  Report the
+   * conservative pre-VGA result so old libraries do not select modern
+   * adapter-specific paths that the standard ELKS kernel cannot expose.
    */
   emit8 (v, 0x31);
   emit8 (v, 0xc0);          /* AL != 1Ah: no display-combo BIOS */
@@ -2044,7 +2257,7 @@ emit_bios_no_enhanced_video_info_stub (struct byte_vec *v)
    * Some DOS libraries probe it before choosing VGA/MCGA paths whose
    * memory layout does not match the legacy CGA/EGA/MDA code they also
    * contain.  Return zero registers with carry clear: a normal, harmless
-   * "no enhanced information" result for conservative direct-video use.
+   * "no enhanced information" result for conservative XT-era behavior.
    */
   emit8 (v, 0x31);
   emit8 (v, 0xc0);          /* AX = 0 */
@@ -2057,41 +2270,17 @@ emit_bios_no_enhanced_video_info_stub (struct byte_vec *v)
 }
 
 static void
-emit_bios_set_palette_stub (struct byte_vec *v)
-{
-  emit8 (v, 0xb4);
-  emit8 (v, 0x0b);                 /* mov ah, 0Bh */
-  emit8 (v, 0xcd);
-  emit8 (v, 0x10);                 /* let BIOS update CGA palette state */
-  emit8 (v, 0xf8);
-  emit8 (v, 0xc3);
-}
-
-static void
 emit_bios_no_ega_info_stub (struct byte_vec *v)
 {
   /*
    * INT 10h AH=12h covers EGA alternate-select functions.  A PC/XT
-   * converter cannot promise that every EGA/VGA direct-memory layout is
-   * safe, so adapter discovery is conservative: leave the caller's query
+   * converter cannot expose EGA/VGA hardware through standard ELKS kernel
+   * calls, so adapter discovery is conservative: leave the caller's query
    * registers unchanged and return carry clear.  Common DOS libraries
-   * interpret that as "no useful EGA information" and continue down their
-   * CGA/MDA-compatible paths unless they explicitly set another mode.
+   * interpret that as "no useful EGA information".
    */
   emit8 (v, 0xf8);
   emit8 (v, 0xc3);
-}
-
-static void
-emit_bios_write_pixel_stub (struct byte_vec *v)
-{
-  emit_bios_video_passthrough_stub (v, 0x0c);
-}
-
-static void
-emit_bios_read_pixel_stub (struct byte_vec *v)
-{
-  emit_bios_video_passthrough_stub (v, 0x0d);
 }
 
 static int
@@ -2100,48 +2289,14 @@ emit_bios_video_stub_for_fn (struct byte_vec *v, uint8_t fn,
 {
   switch (fn)
     {
-    case 0x00:              /* set video mode */
-      emit_bios_set_video_mode_stub (v, rt);
-      return 1;
-    case 0x01:              /* set cursor shape */
-    case 0x02:              /* set cursor position */
-    case 0x05:              /* select active display page */
-    case 0x06:              /* scroll up */
-    case 0x07:              /* scroll down */
-      (void) rt;
-      emit_bios_video_passthrough_stub (v, fn);
-      return 1;
-    case 0x0b:              /* set palette/background */
-      emit_bios_set_palette_stub (v);
-      return 1;
-    case 0x03:              /* get cursor position and size */
-      (void) rt;
-      emit_bios_video_passthrough_stub (v, 0x03);
-      return 1;
-    case 0x08:              /* read character/attribute at cursor */
-      (void) rt;
-      emit_bios_video_passthrough_stub (v, 0x08);
-      return 1;
-    case 0x09:              /* write character/attribute at cursor */
-    case 0x0a:              /* write character at cursor */
-      (void) rt;
-      emit_bios_video_passthrough_stub (v, fn);
-      return 1;
-    case 0x0c:              /* write graphics pixel */
-      (void) rt;
-      emit_bios_write_pixel_stub (v);
-      return 1;
-    case 0x0d:              /* read graphics pixel */
-      (void) rt;
-      emit_bios_read_pixel_stub (v);
+    case 0x00:              /* set text mode, statically filtered */
+      emit_bios_set_text_mode_stub (v, rt);
       return 1;
     case 0x0e:              /* teletype output */
-      (void) rt;
-      emit_bios_video_passthrough_stub (v, 0x0e);
+      emit_bios_teletype_elks_stub (v, rt);
       return 1;
     case 0x0f:              /* get current video mode */
-      (void) rt;
-      emit_bios_video_passthrough_stub (v, 0x0f);
+      emit_bios_get_video_mode_stub (v, rt);
       return 1;
     case 0x12:              /* EGA alternate select/query */
       (void) rt;
@@ -2157,87 +2312,8 @@ emit_bios_video_stub_for_fn (struct byte_vec *v, uint8_t fn,
       return 1;
     default:
       (void) rt;
-      emit_bios_video_passthrough_stub (v, fn);
-      return 1;
+      return 0;
     }
-}
-
-uint16_t
-emit_bios_dynamic_video_stub (struct byte_vec *v,
-                              const struct runtime_info *rt)
-{
-  static const uint8_t special_fns[] = {
-    0x00,                   /* set video mode */
-    0x12,                   /* EGA alternate select/query */
-    0x1a,                   /* display combination code */
-    0x30                    /* enhanced adapter information */
-  };
-  struct fixup
-  {
-    size_t call_rel;
-    size_t finish_rel;
-  };
-  struct fixup fixups[sizeof (special_fns) / sizeof (special_fns[0])];
-  size_t start = v->len;
-  size_t finish;
-  size_t i;
-
-  /*
-   * Many DOS libraries route all BIOS video calls through a helper with AH
-   * already loaded by the caller.  This dynamic adapter keeps that DOS surface
-   * general: known hardware-probe functions use the converter's conservative
-   * XT-compatible stubs, mode set claims the ELKS console before calling the
-   * ROM BIOS, and all other functions pass through to the real BIOS with AH
-   * unchanged.  Only 8088/8086 instructions are emitted.
-   */
-  if (start > ELKS_MAX16)
-    die ("text segment grew beyond 64 KiB while adding int 10h adapter");
-
-  emit8 (v, 0x55);          /* push bp */
-  emit8 (v, 0x56);          /* push si */
-  emit8 (v, 0x57);          /* push di */
-
-  for (i = 0; i < sizeof (special_fns) / sizeof (special_fns[0]); i++)
-    {
-      emit8 (v, 0x80);
-      emit8 (v, 0xfc);
-      emit8 (v, special_fns[i]);        /* cmp ah, imm8 */
-      emit8 (v, 0x75);
-      emit8 (v, 0x06);       /* jne over call+jmp */
-      emit8 (v, 0xe8);       /* call selected BIOS video adapter */
-      fixups[i].call_rel = v->len;
-      emit16 (v, 0);
-      emit8 (v, 0xe9);       /* jmp finish */
-      fixups[i].finish_rel = v->len;
-      emit16 (v, 0);
-    }
-
-  emit8 (v, 0xcd);
-  emit8 (v, 0x10);          /* pass through unhandled video functions */
-
-  finish = v->len;
-  emit8 (v, 0x5f);          /* pop di */
-  emit8 (v, 0x5e);          /* pop si */
-  emit8 (v, 0x5d);          /* pop bp */
-  emit8 (v, 0xc3);          /* ret to the DOS caller */
-
-  for (i = 0; i < sizeof (special_fns) / sizeof (special_fns[0]); i++)
-    {
-      size_t stub = v->len;
-      uint16_t rel;
-
-      if (!emit_bios_video_stub_for_fn (v, special_fns[i], rt))
-        die ("internal int 10h adapter dispatch table mismatch");
-      if (stub > ELKS_MAX16 || v->len > ELKS_MAX16)
-        die ("text segment grew beyond 64 KiB while adding int 10h adapter");
-
-      rel = (uint16_t) (stub - (fixups[i].call_rel + 2u));
-      put16 (v->data + fixups[i].call_rel, rel);
-      rel = (uint16_t) (finish - (fixups[i].finish_rel + 2u));
-      put16 (v->data + fixups[i].finish_rel, rel);
-    }
-
-  return (uint16_t) start;
 }
 
 int
@@ -2263,23 +2339,59 @@ emit_bios_keyboard_stub_for_fn (struct byte_vec *v, uint8_t fn,
     }
 }
 
+static void
+emit_bios_get_ticks_elks_stub (struct byte_vec *v,
+                               const struct runtime_info *rt)
+{
+  /*
+   * INT 1Ah AH=00h returns CX:DX as the BIOS tick count.  ELKS exposes time
+   * through gettimeofday(2).  To avoid 32-bit multiplication/division helpers
+   * on an 8088 target, return the kernel's 32-bit seconds value directly in
+   * CX:DX.  The value is monotonic enough for programs that only check for
+   * progress; it is deliberately documented as seconds, not 18.2 Hz ticks.
+   * No floating point, scaling, or wide C arithmetic is used.
+   */
+  emit8 (v, 0x53);          /* push bx */
+  emit8 (v, 0x51);          /* push cx */
+  emit8 (v, 0x52);          /* push dx */
+  emit8 (v, 0xbb);
+  emit16 (v, rt->io_buf_off);       /* timeval buffer */
+  emit8 (v, 0x31);
+  emit8 (v, 0xc9);          /* no timezone */
+  emit8 (v, 0xb8);
+  emit16 (v, 62);           /* gettimeofday */
+  emit8 (v, 0xcd);
+  emit8 (v, 0x80);
+  emit8 (v, 0x5a);          /* discard saved dx */
+  emit8 (v, 0x59);          /* discard saved cx */
+  emit8 (v, 0x5b);          /* restore bx */
+  emit8 (v, 0x8b);
+  emit8 (v, 0x16);
+  emit16 (v, rt->io_buf_off);       /* dx = seconds low word */
+  emit8 (v, 0x8b);
+  emit8 (v, 0x0e);
+  emit16 (v, (uint16_t) (rt->io_buf_off + 2u)); /* cx = seconds high word */
+  emit8 (v, 0x30);
+  emit8 (v, 0xc0);          /* midnight rollover flag = 0 */
+  emit8 (v, 0xf8);
+  emit8 (v, 0xc3);
+}
+
 static int
-emit_bios_clock_stub_for_fn (struct byte_vec *v, uint8_t fn)
+emit_bios_clock_stub_for_fn (struct byte_vec *v, uint8_t fn,
+                             const struct runtime_info *rt)
 {
   switch (fn)
     {
     case 0x00:              /* get timer ticks */
-      emit_bios_passthrough_stub (v, 0x1a, 0x00);
+      emit_bios_get_ticks_elks_stub (v, rt);
       return 1;
     case 0x01:              /* set timer ticks */
-      emit_bios_passthrough_stub (v, 0x1a, 0x01);
-      return 1;
+      return 0;
     case 0x02:              /* get RTC time, BCD */
-      emit_bios_passthrough_stub (v, 0x1a, 0x02);
-      return 1;
+      return 0;
     case 0x04:              /* get RTC date, BCD */
-      emit_bios_passthrough_stub (v, 0x1a, 0x04);
-      return 1;
+      return 0;
     default:
       return 0;
     }
@@ -2546,7 +2658,7 @@ emit_stub_for_fn (struct byte_vec *v, uint8_t fn,
       emit_zero_cx_success_stub (v);
       return 1;
     case 0x44:
-      emit_zero_dx_success_stub (v);
+      emit_ioctl_stub (v);
       return 1;
     case 0x47:
       emit_get_cwd_stub (v);
@@ -2655,7 +2767,7 @@ emit_stub_for_interrupt (struct byte_vec *v, uint8_t intr, uint8_t fn,
     case 0x17:
       return emit_bios_printer_stub_for_fn (v, fn);
     case 0x1a:
-      return emit_bios_clock_stub_for_fn (v, fn);
+      return emit_bios_clock_stub_for_fn (v, fn, rt);
     case 0x21:
       return emit_stub_for_fn (v, fn, rt);
     case 0x33:
